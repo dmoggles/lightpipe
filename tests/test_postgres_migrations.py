@@ -60,7 +60,7 @@ def test_migration_initializes_empty_database() -> None:
 
 @pytest.mark.postgres
 def test_migration_adopts_legacy_bootstrap_schema() -> None:
-    import psycopg
+    psycopg = pytest.importorskip("psycopg")
 
     with temporary_database() as dsn:
         with psycopg.connect(dsn) as connection:
@@ -84,3 +84,9 @@ def test_migration_adopts_legacy_bootstrap_schema() -> None:
                 "lp_task_attempts",
                 "lp_stage_logs",
             )
+            triggers = connection.execute(
+                "SELECT to_regclass('lp_trigger_occurrences'),"
+                "EXISTS (SELECT FROM information_schema.columns "
+                "WHERE table_name='lp_triggers' AND column_name='definition_hash')"
+            ).fetchone()
+            assert triggers == ("lp_trigger_occurrences", True)

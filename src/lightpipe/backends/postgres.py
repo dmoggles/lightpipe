@@ -28,7 +28,11 @@ from lightpipe.models import (
     TaskLease,
     TaskRecord,
     TaskState,
+    TriggerKind,
     TriggerLease,
+    TriggerOccurrenceRecord,
+    TriggerOccurrenceState,
+    TriggerRecord,
     new_id,
     utcnow,
 )
@@ -115,6 +119,8 @@ class PostgresBackend(OrchestrationBackend):
             output=row["output"],
             rerun_of=row.get("rerun_of"),
             trace_context=row.get("trace_context"),
+            trigger_name=row.get("trigger_name"),
+            trigger_occurrence_id=row.get("trigger_occurrence_id"),
         )
 
     @staticmethod
@@ -152,6 +158,38 @@ class PostgresBackend(OrchestrationBackend):
         )
 
     @staticmethod
+    def _trigger(row: dict[str, Any]) -> TriggerRecord:
+        return TriggerRecord(
+            name=row["name"],
+            kind=TriggerKind(row["kind"]),
+            definition_hash=row["definition_hash"],
+            config=row["config"],
+            enabled=row["enabled"],
+            cursor=row["cursor"],
+            last_due_at=row["last_due_at"],
+            next_due_at=row["next_due_at"],
+            lease_owner=row["lease_owner"],
+            lease_expires_at=row["lease_expires_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _occurrence(row: dict[str, Any]) -> TriggerOccurrenceRecord:
+        return TriggerOccurrenceRecord(
+            id=row["id"],
+            trigger_name=row["trigger_name"],
+            state=TriggerOccurrenceState(row["state"]),
+            occurred_at=row["occurred_at"],
+            scheduled_for=row["scheduled_for"],
+            delivery_id=row["delivery_id"],
+            requests=row["requests"],
+            run_ids=row["run_ids"],
+            detail=row["detail"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
     def _task(row: dict[str, Any]) -> TaskRecord:
         return TaskRecord(
             id=row["id"],
@@ -181,8 +219,9 @@ class PostgresBackend(OrchestrationBackend):
             )
             cursor = await connection.execute(
                 "INSERT INTO lp_runs (id,pipeline_name,definition_hash,parameters,state,output,"
-                "idempotency_key,created_at,updated_at,rerun_of,trace_context) "
-                "VALUES (%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb) "
+                "idempotency_key,created_at,updated_at,rerun_of,trace_context,trigger_name,"
+                "trigger_occurrence_id) "
+                "VALUES (%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb,%s,%s) "
                 f"{conflict}RETURNING *",
                 (
                     run.id,
@@ -196,6 +235,8 @@ class PostgresBackend(OrchestrationBackend):
                     run.updated_at,
                     run.rerun_of,
                     json.dumps(run.trace_context),
+                    run.trigger_name,
+                    run.trigger_occurrence_id,
                 ),
             )
             row = await cursor.fetchone()
@@ -835,7 +876,7 @@ class PostgresBackend(OrchestrationBackend):
                 "UPDATE lp_triggers SET lease_owner=%s,lease_token=%s,"
                 "lease_expires_at=clock_timestamp()+(%s * interval '1 second'),"
                 "updated_at=clock_timestamp() WHERE name=%s "
-                "AND (lease_token IS NULL OR lease_expires_at<=clock_timestamp()) "
+                "AND enabled=true AND (lease_token IS NULL OR lease_expires_at<=clock_timestamp()) "
                 "RETURNING cursor,lease_expires_at",
                 (owner, token, lease_for.total_seconds(), name),
             )
@@ -846,13 +887,22 @@ class PostgresBackend(OrchestrationBackend):
                 else TriggerLease(name, token, row["cursor"], row["lease_expires_at"])
             )
 
-    async def complete_trigger(self, name: str, token: str, cursor: Any) -> None:
+    async def complete_trigger(
+        self,
+        name: str,
+        token: str,
+        cursor: Any,
+        *,
+        last_due_at: datetime | None = None,
+        next_due_at: datetime | None = None,
+    ) -> None:
         async with self._pool.connection() as connection:
             result = await connection.execute(
                 "UPDATE lp_triggers SET cursor=%s::jsonb,lease_owner=NULL,lease_token=NULL,"
-                "lease_expires_at=NULL,updated_at=clock_timestamp() "
+                "lease_expires_at=NULL,last_due_at=COALESCE(%s,last_due_at),next_due_at=%s,"
+                "updated_at=clock_timestamp() "
                 "WHERE name=%s AND lease_token=%s AND lease_expires_at>clock_timestamp()",
-                (json.dumps(cursor), name, token),
+                (json.dumps(cursor), last_due_at, next_due_at, name, token),
             )
             if not result.rowcount:
                 raise StaleLeaseError(f"stale trigger lease for {name}")
@@ -867,6 +917,176 @@ class PostgresBackend(OrchestrationBackend):
             )
             if not result.rowcount:
                 raise StaleLeaseError(f"stale trigger lease for {name}")
+
+    async def register_trigger(self, trigger: TriggerRecord) -> TriggerRecord:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                "INSERT INTO lp_triggers "
+                "(name,cursor,kind,definition_hash,config,enabled,last_due_at,next_due_at,"
+                "created_at,updated_at) VALUES (%s,%s::jsonb,%s,%s,%s::jsonb,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (name) DO UPDATE SET kind=EXCLUDED.kind,"
+                "definition_hash=EXCLUDED.definition_hash,config=EXCLUDED.config,"
+                "next_due_at=COALESCE(lp_triggers.next_due_at,EXCLUDED.next_due_at),"
+                "updated_at=EXCLUDED.updated_at RETURNING *",
+                (
+                    trigger.name,
+                    json.dumps(trigger.cursor),
+                    trigger.kind.value,
+                    trigger.definition_hash,
+                    json.dumps(trigger.config),
+                    trigger.enabled,
+                    trigger.last_due_at,
+                    trigger.next_due_at,
+                    trigger.created_at,
+                    trigger.updated_at,
+                ),
+            )
+            return self._trigger(await cursor.fetchone())
+
+    async def get_trigger(self, name: str) -> TriggerRecord:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute("SELECT * FROM lp_triggers WHERE name=%s", (name,))
+            row = await cursor.fetchone()
+            if row is None or row["kind"] is None:
+                raise KeyError(name)
+            return self._trigger(row)
+
+    async def list_triggers(
+        self,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        kind: str | None = None,
+        enabled: bool | None = None,
+    ) -> tuple[list[TriggerRecord], str | None]:
+        clauses = ["kind IS NOT NULL"]
+        parameters: list[Any] = []
+        if cursor is not None:
+            clauses.append("name>%s")
+            parameters.append(cursor)
+        if kind is not None:
+            clauses.append("kind=%s")
+            parameters.append(kind)
+        if enabled is not None:
+            clauses.append("enabled=%s")
+            parameters.append(enabled)
+        parameters.append(limit + 1)
+        async with self._pool.connection() as connection:
+            result = await connection.execute(
+                f"SELECT * FROM lp_triggers WHERE {' AND '.join(clauses)} ORDER BY name LIMIT %s",
+                parameters,
+            )
+            rows = await result.fetchall()
+        next_cursor = rows[limit - 1]["name"] if len(rows) > limit else None
+        return [self._trigger(row) for row in rows[:limit]], next_cursor
+
+    async def set_trigger_enabled(self, name: str, enabled: bool) -> TriggerRecord:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                "UPDATE lp_triggers SET enabled=%s,updated_at=clock_timestamp(),"
+                "lease_owner=CASE WHEN %s THEN lease_owner ELSE NULL END,"
+                "lease_token=CASE WHEN %s THEN lease_token ELSE NULL END,"
+                "lease_expires_at=CASE WHEN %s THEN lease_expires_at ELSE NULL END "
+                "WHERE name=%s AND kind IS NOT NULL RETURNING *",
+                (enabled, enabled, enabled, enabled, name),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(name)
+            return self._trigger(row)
+
+    async def heartbeat_trigger(
+        self, name: str, token: str, *, lease_for: timedelta = DEFAULT_TRIGGER_LEASE
+    ) -> datetime:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                "UPDATE lp_triggers SET lease_expires_at="
+                "clock_timestamp()+(%s * interval '1 second'),"
+                "updated_at=clock_timestamp() WHERE name=%s AND lease_token=%s "
+                "AND lease_expires_at>clock_timestamp() RETURNING lease_expires_at",
+                (lease_for.total_seconds(), name, token),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise StaleLeaseError(f"stale trigger lease for {name}")
+            return row["lease_expires_at"]
+
+    async def add_trigger_occurrence(
+        self, occurrence: TriggerOccurrenceRecord
+    ) -> tuple[TriggerOccurrenceRecord, bool]:
+        async with self._pool.connection() as connection, connection.transaction():
+            cursor = await connection.execute(
+                "INSERT INTO lp_trigger_occurrences "
+                "(id,trigger_name,state,occurred_at,scheduled_for,delivery_id,requests,run_ids,"
+                "detail,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s) "
+                "ON CONFLICT DO NOTHING RETURNING *",
+                (
+                    occurrence.id,
+                    occurrence.trigger_name,
+                    occurrence.state.value,
+                    occurrence.occurred_at,
+                    occurrence.scheduled_for,
+                    occurrence.delivery_id,
+                    json.dumps(occurrence.requests),
+                    json.dumps(occurrence.run_ids),
+                    occurrence.detail,
+                    occurrence.updated_at,
+                ),
+            )
+            row = await cursor.fetchone()
+            if row is not None:
+                return self._occurrence(row), True
+            if occurrence.delivery_id is not None:
+                cursor = await connection.execute(
+                    "SELECT * FROM lp_trigger_occurrences WHERE trigger_name=%s AND delivery_id=%s",
+                    (occurrence.trigger_name, occurrence.delivery_id),
+                )
+            else:
+                cursor = await connection.execute(
+                    "SELECT * FROM lp_trigger_occurrences WHERE trigger_name=%s "
+                    "AND scheduled_for=%s",
+                    (occurrence.trigger_name, occurrence.scheduled_for),
+                )
+            return self._occurrence(await cursor.fetchone()), False
+
+    async def update_trigger_occurrence(
+        self,
+        occurrence_id: str,
+        state: str,
+        *,
+        run_ids: list[str] | None = None,
+        detail: str | None = None,
+    ) -> TriggerOccurrenceRecord:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                "UPDATE lp_trigger_occurrences SET state=%s,"
+                "run_ids=COALESCE(%s::jsonb,run_ids),detail=%s,updated_at=clock_timestamp() "
+                "WHERE id=%s RETURNING *",
+                (state, None if run_ids is None else json.dumps(run_ids), detail, occurrence_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(occurrence_id)
+            return self._occurrence(row)
+
+    async def trigger_history(
+        self, name: str, *, limit: int = 100, cursor: str | None = None
+    ) -> tuple[list[TriggerOccurrenceRecord], str | None]:
+        parameters: list[Any] = [name]
+        clause = ""
+        if cursor is not None:
+            clause = "AND sequence<(SELECT sequence FROM lp_trigger_occurrences WHERE id=%s) "
+            parameters.append(cursor)
+        parameters.append(limit + 1)
+        async with self._pool.connection() as connection:
+            result = await connection.execute(
+                "SELECT * FROM lp_trigger_occurrences WHERE trigger_name=%s "
+                f"{clause}ORDER BY sequence DESC LIMIT %s",
+                parameters,
+            )
+            rows = await result.fetchall()
+        next_cursor = rows[limit - 1]["id"] if len(rows) > limit else None
+        return [self._occurrence(row) for row in rows[:limit]], next_cursor
 
     async def close(self) -> None:
         await self._pool.close()

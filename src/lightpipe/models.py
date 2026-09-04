@@ -47,6 +47,33 @@ class TaskState(StrEnum):
         }
 
 
+class TriggerKind(StrEnum):
+    POLLER = "poller"
+    INTERVAL = "interval"
+    CRON = "cron"
+    WEBHOOK = "webhook"
+
+
+class OverlapPolicy(StrEnum):
+    SKIP = "skip"
+    QUEUE = "queue"
+    ALLOW = "allow"
+
+
+class MissedRunPolicy(StrEnum):
+    COALESCE = "coalesce"
+    CATCH_UP = "catch_up"
+    SKIP = "skip"
+
+
+class TriggerOccurrenceState(StrEnum):
+    PENDING = "pending"
+    LAUNCHED = "launched"
+    SKIPPED = "skipped"
+    COALESCED = "coalesced"
+    FAILED = "failed"
+
+
 class AttemptState(StrEnum):
     LEASED = "leased"
     RUNNING = "running"
@@ -120,6 +147,8 @@ class RunRecord:
     output: Any = None
     rerun_of: str | None = None
     trace_context: dict[str, str] | None = None
+    trigger_name: str | None = None
+    trigger_occurrence_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -207,6 +236,36 @@ class TriggerLease:
     token: str
     cursor: Any
     expires_at: datetime
+
+
+@dataclass(slots=True)
+class TriggerRecord:
+    name: str
+    kind: TriggerKind
+    definition_hash: str
+    config: dict[str, JsonValue]
+    enabled: bool = True
+    cursor: Any = None
+    last_due_at: datetime | None = None
+    next_due_at: datetime | None = None
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass(slots=True)
+class TriggerOccurrenceRecord:
+    id: str
+    trigger_name: str
+    state: TriggerOccurrenceState
+    occurred_at: datetime
+    scheduled_for: datetime | None = None
+    delivery_id: str | None = None
+    requests: list[dict[str, JsonValue]] = field(default_factory=list)
+    run_ids: list[str] = field(default_factory=list)
+    detail: str | None = None
+    updated_at: datetime = field(default_factory=utcnow)
 
 
 class BackendError(RuntimeError):

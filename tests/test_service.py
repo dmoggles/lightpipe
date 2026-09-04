@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import subprocess
 import sys
+import time
 from datetime import timedelta
 
 import httpx
@@ -16,9 +19,11 @@ from lightpipe import (
     Runtime,
     ServiceSupervisor,
     TaskState,
+    WebhookEvent,
     pipeline,
     poller,
     stage,
+    webhook,
 )
 from lightpipe.api import create_app
 from lightpipe.cli import parser
@@ -182,6 +187,78 @@ async def test_api_lifecycle_and_run_submission() -> None:
 
 
 @pytest.mark.asyncio
+async def test_authenticated_webhook_and_trigger_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    @pipeline
+    def flow(value: int):
+        return value
+
+    @webhook(secret_env="TEST_WEBHOOK_SECRET")
+    def incoming(event: WebhookEvent):
+        return flow(event.payload["value"])
+
+    monkeypatch.setenv("TEST_WEBHOOK_SECRET", "secret")
+    runtime = Runtime(MemoryBackend())
+    app = create_app(
+        runtime,
+        {flow.name: flow},
+        triggers=(incoming,),
+        worker_count=0,
+        run_triggers=False,
+    )
+    transport = httpx.ASGITransport(app=app)
+    body = b'{"value":7}'
+    timestamp = str(int(time.time()))
+    signature = (
+        "sha256="
+        + hmac.new(
+            b"secret", timestamp.encode() + b".delivery-7." + body, hashlib.sha256
+        ).hexdigest()
+    )
+    headers = {
+        "content-type": "application/json",
+        "x-lightpipe-timestamp": timestamp,
+        "x-lightpipe-delivery": "delivery-7",
+        "x-lightpipe-signature": signature,
+    }
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
+    ):
+        assert (await client.post("/api/v1/webhooks/incoming", content=body)).status_code == 401
+        response = await client.post("/api/v1/webhooks/incoming", content=body, headers=headers)
+        assert response.status_code == 202
+        assert len(response.json()["run_ids"]) == 1
+        duplicate = await client.post("/api/v1/webhooks/incoming", content=body, headers=headers)
+        assert duplicate.json()["id"] == response.json()["id"]
+        triggers = (await client.get("/api/v1/triggers")).json()["items"]
+        assert triggers[0]["name"] == "incoming"
+        assert (await client.post("/api/v1/triggers/incoming/pause")).json()["enabled"] is False
+        paused = await client.post(
+            "/api/v1/webhooks/incoming",
+            content=body,
+            headers={**headers, "x-lightpipe-delivery": "delivery-8"},
+        )
+        assert paused.status_code == 401
+        paused_signature = (
+            "sha256="
+            + hmac.new(
+                b"secret", timestamp.encode() + b".delivery-8." + body, hashlib.sha256
+            ).hexdigest()
+        )
+        paused = await client.post(
+            "/api/v1/webhooks/incoming",
+            content=body,
+            headers={
+                **headers,
+                "x-lightpipe-delivery": "delivery-8",
+                "x-lightpipe-signature": paused_signature,
+            },
+        )
+        assert paused.status_code == 409
+        assert (await client.post("/api/v1/triggers/incoming/resume")).json()["enabled"] is True
+
+
+@pytest.mark.asyncio
 async def test_api_retries_failed_mapped_item_in_place() -> None:
     failed_once: set[int] = set()
     saved: list[int] = []
@@ -251,6 +328,10 @@ def test_serve_command_defaults() -> None:
     assert retry.task_id == ["task_1"]
     runs = parser().parse_args(["runs", "--state", "failed", "--limit", "25"])
     assert runs.limit == 25
+    scheduler = parser().parse_args(["scheduler", "module:flow", "module:daily"])
+    assert scheduler.poll_interval == 1.0
+    trigger = parser().parse_args(["trigger", "pause", "daily"])
+    assert trigger.trigger_command == "pause"
 
 
 def test_module_entrypoint() -> None:

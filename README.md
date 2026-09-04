@@ -21,6 +21,7 @@ The project currently includes:
 - filesystem and S3-compatible artifact stores;
 - long-lived workers with supervised task subprocesses;
 - schedule and stateful-poller definitions;
+- timezone-aware cron schedules, signed webhooks, and managed trigger history;
 - a CLI and a runnable FastAPI monitoring/control service.
 - a bundled React operations dashboard with DAG, attempt, log, artifact, and recovery views;
 - optional OpenTelemetry traces, metrics, and correlated logs.
@@ -112,6 +113,16 @@ Open `http://127.0.0.1:8000` to submit and inspect runs. The service also expose
 with Ctrl-C; active tasks are allowed a grace period and then safely released for another worker.
 
 Pass additional `module:object` arguments to register pollers or schedules alongside pipelines.
+Webhook definitions are accepted as well. For production, pass `--no-scheduler` to `serve` and
+run independently scalable scheduler replicas:
+
+```bash
+uv run lightpipe --backend "$DATABASE_URL" scheduler \
+  my_project:pipeline my_project:daily_schedule my_project:incoming_webhook
+```
+
+See [Trigger automation](docs/trigger-automation.md) for cron/DST behavior, overlap and missed-run
+policies, webhook signing, pause/resume controls, recovery semantics, and a runnable example.
 Use `--workers N` for a larger local worker pool and `--no-process-isolation` when debugging stage
 functions in the server process. Run `uv run lightpipe serve --help` for all options.
 

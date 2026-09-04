@@ -18,6 +18,8 @@ from lightpipe.models import (
     TaskLease,
     TaskRecord,
     TriggerLease,
+    TriggerOccurrenceRecord,
+    TriggerRecord,
 )
 
 DEFAULT_TASK_LEASE = timedelta(minutes=5)
@@ -196,10 +198,62 @@ class OrchestrationBackend(ABC):
     ) -> TriggerLease | None: ...
 
     @abstractmethod
-    async def complete_trigger(self, name: str, token: str, cursor: Any) -> None: ...
+    async def complete_trigger(
+        self,
+        name: str,
+        token: str,
+        cursor: Any,
+        *,
+        last_due_at: datetime | None = None,
+        next_due_at: datetime | None = None,
+    ) -> None: ...
 
     @abstractmethod
     async def fail_trigger(self, name: str, token: str) -> None: ...
+
+    @abstractmethod
+    async def register_trigger(self, trigger: TriggerRecord) -> TriggerRecord: ...
+
+    @abstractmethod
+    async def get_trigger(self, name: str) -> TriggerRecord: ...
+
+    @abstractmethod
+    async def list_triggers(
+        self,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        kind: str | None = None,
+        enabled: bool | None = None,
+    ) -> tuple[list[TriggerRecord], str | None]: ...
+
+    @abstractmethod
+    async def set_trigger_enabled(self, name: str, enabled: bool) -> TriggerRecord: ...
+
+    @abstractmethod
+    async def heartbeat_trigger(
+        self, name: str, token: str, *, lease_for: timedelta = DEFAULT_TRIGGER_LEASE
+    ) -> datetime: ...
+
+    @abstractmethod
+    async def add_trigger_occurrence(
+        self, occurrence: TriggerOccurrenceRecord
+    ) -> tuple[TriggerOccurrenceRecord, bool]: ...
+
+    @abstractmethod
+    async def update_trigger_occurrence(
+        self,
+        occurrence_id: str,
+        state: str,
+        *,
+        run_ids: list[str] | None = None,
+        detail: str | None = None,
+    ) -> TriggerOccurrenceRecord: ...
+
+    @abstractmethod
+    async def trigger_history(
+        self, name: str, *, limit: int = 100, cursor: str | None = None
+    ) -> tuple[list[TriggerOccurrenceRecord], str | None]: ...
 
     async def subscribe(self, run_id: str, *, after: str | None = None) -> AsyncIterator[Event]:
         for event in await self.events(run_id, after=after):

@@ -81,6 +81,10 @@ lightpipe --backend "$DATABASE_URL" serve \
 Add any `module:object` poller and schedule definitions to the same command. The control process
 runs their leased scheduler loops as well as graph reconciliation.
 
+For production, add `--no-scheduler` to the API command and run the same pipeline and trigger
+definitions through `lightpipe scheduler` in one or more independent replicas. Postgres trigger
+leases fence competing replicas; see [Trigger automation](trigger-automation.md).
+
 Route traffic only after `GET /health/ready` returns HTTP 200. `GET /health/live` confirms the
 process is alive. The dashboard is served at `/`; in the current release `/api/workers` reports
 only workers embedded in that control process, so it is empty in control-only mode.

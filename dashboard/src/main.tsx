@@ -12,6 +12,8 @@ type Artifact = { path: string; $artifact: string; media_type?: string; digest?:
 type Detail = { run: Run & { parameters: unknown; output: unknown }; graph: Graph | null; graph_available: boolean; tasks: Task[]; artifacts: Artifact[] };
 type Log = { id: string; occurred_at: string; attempt: number; stream: string; level: string; logger?: string; message: string; fields: Record<string, unknown> };
 type Page<T> = { items: T[]; next_cursor: string | null };
+type Trigger = { name: string; kind: string; definition_hash: string; config: Record<string, unknown>; enabled: boolean; last_due_at?: string; next_due_at?: string; lease_owner?: string; lease_expires_at?: string };
+type Occurrence = { id: string; trigger_name: string; state: string; occurred_at: string; scheduled_for?: string; delivery_id?: string; run_ids: string[]; detail?: string };
 
 async function api<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
@@ -92,6 +94,20 @@ function App() {
   const [params, setParams] = useState("{}");
   const [streamVersion, setStreamVersion] = useState(0);
   const [service, setService] = useState<{started: boolean; workers: {state: string}[]; triggers: unknown[]} | null>(null);
+  const [triggers, setTriggers] = useState<Trigger[]>([]);
+  const [selectedTrigger, setSelectedTrigger] = useState<string | null>(null);
+  const [triggerHistory, setTriggerHistory] = useState<Occurrence[]>([]);
+
+  const loadTriggers = useCallback(async () => {
+    const value = await api<Page<Trigger>>("/api/v1/triggers?limit=100");
+    setTriggers(value.items);
+    setSelectedTrigger(current => current || value.items[0]?.name || null);
+  }, []);
+
+  const loadTriggerHistory = useCallback(async (name: string) => {
+    const value = await api<Page<Occurrence>>(`/api/v1/triggers/${encodeURIComponent(name)}/history?limit=50`);
+    setTriggerHistory(value.items);
+  }, []);
 
   const loadRuns = useCallback(async (cursor: string | null = cursors[page]) => {
     const query = new URLSearchParams({ limit: "25" });
@@ -112,6 +128,14 @@ function App() {
   }, []);
 
   useEffect(() => { api<{name: string; definition_hash: string; parameters: string[]}[]>("/api/pipelines").then(value => { setPipelines(value); setNewPipeline(value[0]?.name || ""); }).catch(e => setError(e.message)); }, []);
+  useEffect(() => { loadTriggers().catch(e => setError(e.message)); }, [loadTriggers]);
+  useEffect(() => {
+    if (!selectedTrigger) { setTriggerHistory([]); return; }
+    loadTriggerHistory(selectedTrigger).catch(e => setError(e.message));
+    const stream = new EventSource(`/api/v1/triggers/${encodeURIComponent(selectedTrigger)}/events`);
+    stream.onmessage = () => { loadTriggers(); loadTriggerHistory(selectedTrigger); };
+    return () => stream.close();
+  }, [selectedTrigger, loadTriggerHistory, loadTriggers]);
   useEffect(() => { loadRuns().catch(e => setError(e.message)); }, [loadRuns]);
   useEffect(() => {
     const refresh = () => { loadRuns().catch(e => setError(e.message)); api<{started: boolean; workers: {state: string}[]; triggers: unknown[]}>("/api/workers").then(setService).catch(e => setError(e.message)); };
@@ -159,6 +183,15 @@ function App() {
     } catch (e) { setError((e as Error).message); }
   }
 
+  async function triggerControl(trigger: Trigger) {
+    const action = trigger.enabled ? "pause" : "resume";
+    if (!window.confirm(`${action} trigger ${trigger.name}?`)) return;
+    try {
+      await api(`/api/v1/triggers/${encodeURIComponent(trigger.name)}/${action}`, { method: "POST" });
+      await loadTriggers();
+    } catch (e) { setError((e as Error).message); }
+  }
+
   const allArtifacts = [...(detail?.artifacts || []), ...(detail?.tasks.flatMap(task => task.artifacts) || [])];
   return <div className="shell">
     <aside>
@@ -169,6 +202,12 @@ function App() {
     <main>
       <header><div><p className="eyebrow">ORCHESTRATION</p><h1>Pipeline runs</h1></div><button className="primary" onClick={submit}>New run</button></header>
       {error && <div className="alert" role="alert"><span>{error}</span><button onClick={() => setError("")}>Dismiss</button></div>}
+      <section className="panel trigger-panel">
+        <div className="run-heading"><div><p className="eyebrow">AUTOMATION</p><h2>Triggers</h2></div><span className="muted">{triggers.length} registered</span></div>
+        <div className="split"><div className="task-list">{triggers.map(trigger => <button key={trigger.name} className={selectedTrigger === trigger.name ? "selected-task" : ""} onClick={() => setSelectedTrigger(trigger.name)}><span><strong>{trigger.name}</strong><small>{trigger.kind} · {trigger.next_due_at ? `next ${fmt(trigger.next_due_at)}` : "event driven"}</small></span><StateBadge state={trigger.enabled ? "succeeded" : "skipped"} /></button>)}{!triggers.length && <div className="empty">No triggers are registered.</div>}</div>
+          <div className="attempts">{selectedTrigger && triggers.filter(item => item.name === selectedTrigger).map(trigger => <article key={trigger.name}><div><strong>{trigger.name}</strong><button onClick={() => triggerControl(trigger)}>{trigger.enabled ? "Pause" : "Resume"}</button></div><dl><dt>Kind</dt><dd>{trigger.kind}</dd><dt>Last due</dt><dd>{fmt(trigger.last_due_at)}</dd><dt>Next due</dt><dd>{fmt(trigger.next_due_at)}</dd><dt>Lease</dt><dd>{trigger.lease_owner || "—"}</dd></dl><code>{JSON.stringify(trigger.config)}</code></article>)}
+          {triggerHistory.map(item => <article key={item.id}><div><strong>{item.scheduled_for ? fmt(item.scheduled_for) : item.delivery_id || item.id}</strong><StateBadge state={item.state} /></div><p className="muted">{item.run_ids.length ? `${item.run_ids.length} linked run(s)` : item.detail || "No run launched"}</p>{item.run_ids.map(id => <button className="link" key={id} onClick={() => setSelectedRun(id)}>{id}</button>)}</article>)}</div></div>
+      </section>
       <section className="toolbar" aria-label="Run filters">
         <label>Pipeline<input value={pipeline} onChange={e => { setPipeline(e.target.value); setPage(0); setCursors([null]); }} placeholder="All pipelines" /></label>
         <label>Version<input value={definition} onChange={e => { setDefinition(e.target.value); setPage(0); setCursors([null]); }} placeholder="Definition hash" /></label>

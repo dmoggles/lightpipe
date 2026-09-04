@@ -106,13 +106,28 @@ class Runtime:
         return graph.definition_hash
 
     async def submit(
-        self, invocation: PipelineInvocation, *, idempotency_key: str | None = None
+        self,
+        invocation: PipelineInvocation,
+        *,
+        idempotency_key: str | None = None,
+        trigger_name: str | None = None,
+        trigger_occurrence_id: str | None = None,
     ) -> RunRecord:
         with span("lightpipe.run.submit", pipeline=invocation.graph.name):
-            return await self._submit(invocation, idempotency_key=idempotency_key)
+            return await self._submit(
+                invocation,
+                idempotency_key=idempotency_key,
+                trigger_name=trigger_name,
+                trigger_occurrence_id=trigger_occurrence_id,
+            )
 
     async def _submit(
-        self, invocation: PipelineInvocation, *, idempotency_key: str | None = None
+        self,
+        invocation: PipelineInvocation,
+        *,
+        idempotency_key: str | None = None,
+        trigger_name: str | None = None,
+        trigger_occurrence_id: str | None = None,
     ) -> RunRecord:
         graph = invocation.graph
         add_metric("lightpipe.run.submissions", pipeline=graph.name)
@@ -133,6 +148,8 @@ class Runtime:
             trace_context=(
                 None if trace_id is None else {"trace_id": trace_id, "span_id": span_id or ""}
             ),
+            trigger_name=trigger_name,
+            trigger_occurrence_id=trigger_occurrence_id,
         )
         stored = await self.backend.create_run(run)
         if stored.id != run.id:

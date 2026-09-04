@@ -8,11 +8,11 @@ Lightpipe now has working local and durable Postgres deployment paths. Pipeline 
 against both backends, versioned migrations replace schema bootstrap, and Compose runs the control
 API and workers as separate processes.
 
-It is not yet production-ready. Authentication, retention automation, trigger management, and
+It is not yet production-ready. General control-plane authentication, retention automation, and
 sustained-load hardening remain incomplete.
 
-The next milestone is trigger automation: add cron and webhook triggers, overlap policies,
-pause/resume controls, missed-run handling, and trigger history.
+The next milestone is storage and execution hardening: retention, concurrency controls,
+backpressure, backfills, draining, and load testing.
 
 ## Maturity definitions
 
@@ -34,10 +34,10 @@ pause/resume controls, missed-run handling, and trigger history.
 | Postgres backend | Verified | PostgreSQL 16, Alembic migrations, concurrency, fencing, events, cache, triggers, and worker-kill recovery | Sustained load and network-partition testing |
 | Result caching | Verified | Opt-in cache policy, deterministic keys, TTL expiry, and cross-run reuse | Manual invalidation controls and artifact-aware garbage collection |
 | Artifact storage | Verified locally | Content-addressed filesystem store and S3-compatible adapter | S3 integration tests, reference accounting, retention jobs, and pinning |
-| Triggers | Verified locally | Running interval schedules and stateful pollers with cursor leases and idempotent run requests | Cron expressions, webhook registry, overlap policies, and trigger history UI |
-| CLI | Verified | Local/durable execution, inspection, filtered runs, cancel, rerun, and retry-failed commands | Trigger-management and garbage-collection commands |
+| Triggers | Verified locally | Interval/poller/cron/webhook definitions, DST behavior, fenced schedulers, policies, HMAC ingress, controls, and history UI | Sustained multi-replica and network-partition testing |
+| CLI | Verified | Local/durable execution, inspection, run controls, independent scheduler, and trigger management | Garbage-collection and backfill commands |
 | Control API | Verified locally | Versioned pagination/filtering, graph/attempt/log views and streams, recovery controls, health, and worker status | Authentication and live Postgres deployment testing |
-| Dashboard | Verified locally | Bundled React UI with DAG, mapped items, attempts, live logs, artifacts, filters, and recovery controls | Trigger history and high-cardinality graph virtualization |
+| Dashboard | Verified locally | Bundled React UI with run recovery plus trigger state, history, linked runs, and pause/resume | High-cardinality graph virtualization |
 | Observability | Implemented | Durable structured stage logs plus optional correlated OpenTelemetry traces, metrics, and logs | Collector integration and sustained-volume tests |
 | Production controls | Planned | Basic lease and retry primitives exist | Priorities, quotas, backpressure, backfills, retention workers, and recovery tooling |
 
@@ -54,7 +54,7 @@ uv run pytest -q
 uv build
 ```
 
-The automated suite contains 53 tests with Postgres enabled, covering:
+The automated suite contains 65 tests, covering:
 
 - linear DAG execution;
 - dynamic maps, collection, terminal maps, and empty maps;
@@ -65,7 +65,7 @@ The automated suite contains 53 tests with Postgres enabled, covering:
 - continued processing of successful items after a mapped sibling fails;
 - content-addressed filesystem artifacts;
 - backend task identity, exclusive claims, and cancellation;
-- poller cursors and schedule idempotency.
+- poller cursors and schedule idempotency;
 - service startup/readiness, API submission, worker status, immediate triggers, and graceful task
   release during shutdown.
 - memory/Postgres conformance, concurrent claims and submissions, terminal-state fencing, and
@@ -73,6 +73,8 @@ The automated suite contains 53 tests with Postgres enabled, covering:
 - durable graph definitions, attempt lifecycle and timings, fenced stage logs, pagination, linked
   reruns, and in-place recovery of failed mapped items.
 - versioned monitoring APIs, bundled dashboard assets, and optional observability configuration.
+- cron/DST evaluation, missed-run coalescing, managed trigger history, pause/resume, independent
+  scheduler commands, and authenticated idempotent webhook delivery.
 
 The packaged CLI also passes an end-to-end run of
 `examples.scrape_and_predict:scrape_and_predict` using the in-memory backend.
@@ -129,7 +131,7 @@ Goal: make run behavior understandable and recoverable without querying storage 
 Acceptance criteria: an operator can identify a failed mapped item, inspect its attempts and logs,
 retry it, and observe the downstream graph complete from the dashboard.
 
-### Milestone 4: Trigger automation
+### Milestone 4: Trigger automation — complete (2026-09-04)
 
 Goal: operate scheduled scraping and event-driven prediction workflows without external glue.
 
@@ -171,9 +173,8 @@ runtime, worker, trigger, CLI, or API code.
 
 ## Recommended next step
 
-Begin Milestone 4 with cron expressions that have explicit IANA time zones and tested daylight-
-saving behavior. Add overlap and missed-run policies before exposing trigger pause/resume and
-history controls in the dashboard.
+Begin Milestone 5 with explicit retention policies and reference-safe artifact garbage collection,
+then add global and per-pipeline concurrency limits before load testing mixed workloads.
 
 ## Explicit non-goals for the initial release
 
