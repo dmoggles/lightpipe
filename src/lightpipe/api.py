@@ -56,7 +56,7 @@ def create_app(
         finally:
             await service.stop()
 
-    app = FastAPI(title="lightpipe", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="lightpipe", version="0.2.0", lifespan=lifespan)
     app.state.lightpipe_service = service
 
     @app.get("/health/live")

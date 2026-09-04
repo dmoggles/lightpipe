@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: lightpipe_test
+          POSTGRES_USER: lightpipe
+          POSTGRES_PASSWORD: lightpipe
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lightpipe -d lightpipe_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      LIGHTPIPE_TEST_POSTGRES_DSN: postgresql://lightpipe:lightpipe@127.0.0.1:5432/lightpipe_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --all-extras --locked
+      - run: uv run lightpipe --backend "$LIGHTPIPE_TEST_POSTGRES_DSN" db upgrade
+      - run: uv lock --check
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run ty check
+      - run: uv run pytest -q
+      - run: uv build

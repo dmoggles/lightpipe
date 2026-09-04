@@ -12,12 +12,14 @@ from lightpipe.backends.base import (
     BackendCapabilities,
     OrchestrationBackend,
 )
+from lightpipe.migration import HEAD_REVISION
 from lightpipe.models import (
     CacheEntry,
     Event,
     InvalidTransitionError,
     RunRecord,
     RunState,
+    SchemaVersionError,
     StaleLeaseError,
     TaskLease,
     TaskRecord,
@@ -27,73 +29,6 @@ from lightpipe.models import (
     utcnow,
 )
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS lp_runs (
-  id text PRIMARY KEY,
-  pipeline_name text NOT NULL,
-  definition_hash text NOT NULL,
-  parameters jsonb NOT NULL,
-  state text NOT NULL,
-  output jsonb,
-  idempotency_key text,
-  created_at timestamptz NOT NULL,
-  updated_at timestamptz NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS lp_run_idempotency
-  ON lp_runs (pipeline_name, idempotency_key) WHERE idempotency_key IS NOT NULL;
-CREATE TABLE IF NOT EXISTS lp_tasks (
-  id text PRIMARY KEY,
-  run_id text NOT NULL REFERENCES lp_runs(id) ON DELETE CASCADE,
-  node_id text NOT NULL,
-  map_index integer,
-  state text NOT NULL,
-  attempt integer NOT NULL DEFAULT 0,
-  available_at timestamptz NOT NULL,
-  lease_owner text,
-  lease_token text,
-  lease_expires_at timestamptz,
-  output jsonb,
-  error text,
-  cache_key text,
-  created_at timestamptz NOT NULL,
-  updated_at timestamptz NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS lp_task_identity
-  ON lp_tasks (run_id, node_id, COALESCE(map_index, -1));
-CREATE INDEX IF NOT EXISTS lp_task_claim
-  ON lp_tasks (state, available_at, created_at);
-CREATE TABLE IF NOT EXISTS lp_expansions (
-  run_id text NOT NULL REFERENCES lp_runs(id) ON DELETE CASCADE,
-  node_id text NOT NULL,
-  item_count integer NOT NULL,
-  PRIMARY KEY (run_id, node_id)
-);
-CREATE TABLE IF NOT EXISTS lp_events (
-  sequence bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  id text UNIQUE NOT NULL,
-  run_id text NOT NULL REFERENCES lp_runs(id) ON DELETE CASCADE,
-  task_id text,
-  kind text NOT NULL,
-  payload jsonb NOT NULL,
-  occurred_at timestamptz NOT NULL
-);
-CREATE INDEX IF NOT EXISTS lp_event_run_sequence ON lp_events (run_id, sequence);
-CREATE TABLE IF NOT EXISTS lp_cache (
-  key text PRIMARY KEY,
-  output jsonb NOT NULL,
-  created_at timestamptz NOT NULL,
-  expires_at timestamptz NOT NULL
-);
-CREATE TABLE IF NOT EXISTS lp_triggers (
-  name text PRIMARY KEY,
-  cursor jsonb,
-  lease_owner text,
-  lease_token text,
-  lease_expires_at timestamptz,
-  updated_at timestamptz NOT NULL
-);
-"""
-
 
 class PostgresBackend(OrchestrationBackend):
     capabilities = BackendCapabilities(
@@ -102,11 +37,13 @@ class PostgresBackend(OrchestrationBackend):
 
     def __init__(self, dsn: str, *, min_size: int = 1, max_size: int = 10) -> None:
         try:
+            from psycopg import errors
             from psycopg.rows import dict_row
             from psycopg_pool import AsyncConnectionPool
         except ImportError as error:
             raise RuntimeError("install lightpipe[postgres] to use PostgresBackend") from error
         self._dict_row = dict_row
+        self._undefined_table = errors.UndefinedTable
         self._pool: Any = AsyncConnectionPool(
             dsn,
             min_size=min_size,
@@ -117,8 +54,22 @@ class PostgresBackend(OrchestrationBackend):
 
     async def initialize(self) -> None:
         await self._pool.open()
-        async with self._pool.connection() as connection:
-            await connection.execute(SCHEMA)
+        try:
+            async with self._pool.connection() as connection:
+                cursor = await connection.execute("SELECT version_num FROM alembic_version LIMIT 1")
+                row = await cursor.fetchone()
+        except self._undefined_table as error:
+            await self._pool.close()
+            raise SchemaVersionError(
+                "Postgres schema is not initialized; run `lightpipe --backend URL db upgrade`"
+            ) from error
+        if row is None or row["version_num"] != HEAD_REVISION:
+            await self._pool.close()
+            current = None if row is None else row["version_num"]
+            raise SchemaVersionError(
+                f"Postgres schema revision is {current!r}, expected {HEAD_REVISION!r}; "
+                "run `lightpipe --backend URL db upgrade`"
+            )
 
     async def healthcheck(self) -> bool:
         try:
@@ -182,15 +133,15 @@ class PostgresBackend(OrchestrationBackend):
 
     async def create_run(self, run: RunRecord) -> RunRecord:
         async with self._pool.connection() as connection, connection.transaction():
-            if run.idempotency_key:
-                cursor = await connection.execute(
-                    "SELECT * FROM lp_runs WHERE pipeline_name=%s AND idempotency_key=%s",
-                    (run.pipeline_name, run.idempotency_key),
-                )
-                if row := await cursor.fetchone():
-                    return self._run(row)
-            await connection.execute(
-                "INSERT INTO lp_runs VALUES (%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s)",
+            conflict = (
+                "ON CONFLICT (pipeline_name,idempotency_key) "
+                "WHERE idempotency_key IS NOT NULL DO NOTHING "
+                if run.idempotency_key is not None
+                else ""
+            )
+            cursor = await connection.execute(
+                "INSERT INTO lp_runs VALUES (%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s) "
+                f"{conflict}RETURNING *",
                 (
                     run.id,
                     run.pipeline_name,
@@ -203,8 +154,15 @@ class PostgresBackend(OrchestrationBackend):
                     run.updated_at,
                 ),
             )
-            await self._event(connection, run.id, "run.created")
-        return run
+            row = await cursor.fetchone()
+            if row is not None:
+                await self._event(connection, run.id, "run.created")
+                return self._run(row)
+            cursor = await connection.execute(
+                "SELECT * FROM lp_runs WHERE pipeline_name=%s AND idempotency_key=%s",
+                (run.pipeline_name, run.idempotency_key),
+            )
+            return self._run(await cursor.fetchone())
 
     async def get_run(self, run_id: str) -> RunRecord:
         async with self._pool.connection() as connection:
@@ -225,7 +183,8 @@ class PostgresBackend(OrchestrationBackend):
         async with self._pool.connection() as connection, connection.transaction():
             cursor = await connection.execute(
                 "UPDATE lp_runs SET state=%s, output=%s::jsonb, updated_at=%s "
-                "WHERE id=%s AND (state<>%s OR output IS DISTINCT FROM %s::jsonb)",
+                "WHERE id=%s AND (state<>%s OR output IS DISTINCT FROM %s::jsonb) "
+                "AND (state NOT IN ('succeeded','failed','cancelled') OR state=%s)",
                 (
                     state.value,
                     json.dumps(output),
@@ -233,10 +192,24 @@ class PostgresBackend(OrchestrationBackend):
                     run_id,
                     state.value,
                     json.dumps(output),
+                    state.value,
                 ),
             )
             if cursor.rowcount:
                 await self._event(connection, run_id, f"run.{state.value}")
+                return
+            cursor = await connection.execute("SELECT state FROM lp_runs WHERE id=%s", (run_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            if row["state"] != state.value and row["state"] in {
+                "succeeded",
+                "failed",
+                "cancelled",
+            }:
+                raise InvalidTransitionError(
+                    f"run {run_id} is already terminal in state {row['state']}"
+                )
 
     async def add_task(self, task: TaskRecord) -> tuple[TaskRecord, bool]:
         async with self._pool.connection() as connection, connection.transaction():
@@ -277,22 +250,23 @@ class PostgresBackend(OrchestrationBackend):
     async def claim_tasks(
         self, worker_id: str, *, limit: int = 1, lease_for: timedelta = DEFAULT_TASK_LEASE
     ) -> list[TaskLease]:
-        now = utcnow()
-        expires = now + lease_for
         async with self._pool.connection() as connection, connection.transaction():
             cursor = await connection.execute(
                 "WITH candidates AS (SELECT id FROM lp_tasks WHERE state='runnable' "
-                "AND available_at<=%s ORDER BY available_at,created_at "
+                "AND available_at<=clock_timestamp() ORDER BY available_at,created_at "
                 "FOR UPDATE SKIP LOCKED LIMIT %s) "
                 "UPDATE lp_tasks t SET state='leased',attempt=t.attempt+1,lease_owner=%s,"
                 "lease_token='lease_' || md5(random()::text || clock_timestamp()::text),"
-                "lease_expires_at=%s,updated_at=%s FROM candidates c WHERE t.id=c.id RETURNING t.*",
-                (now, limit, worker_id, expires, now),
+                "lease_expires_at=clock_timestamp()+(%s * interval '1 second'),"
+                "updated_at=clock_timestamp() FROM candidates c WHERE t.id=c.id RETURNING t.*",
+                (limit, worker_id, lease_for.total_seconds()),
             )
             rows = await cursor.fetchall()
             for row in rows:
                 await self._event(connection, row["run_id"], "task.leased", task_id=row["id"])
-        return [TaskLease(self._task(row), row["lease_token"], expires) for row in rows]
+        return [
+            TaskLease(self._task(row), row["lease_token"], row["lease_expires_at"]) for row in rows
+        ]
 
     async def _transition_leased(
         self,
@@ -303,35 +277,40 @@ class PostgresBackend(OrchestrationBackend):
         kind: str,
         *,
         payload: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         async with self._pool.connection() as connection, connection.transaction():
             cursor = await connection.execute(
-                f"UPDATE lp_tasks SET {assignments},updated_at=%s WHERE id=%s AND lease_token=%s "
-                "AND lease_expires_at>=%s AND state IN ('leased','running') RETURNING run_id",
-                (*values, utcnow(), task_id, token, utcnow()),
+                f"UPDATE lp_tasks SET {assignments},updated_at=clock_timestamp() "
+                "WHERE id=%s AND lease_token=%s AND lease_expires_at>=clock_timestamp() "
+                "AND state IN ('leased','running') RETURNING run_id,lease_expires_at",
+                (*values, task_id, token),
             )
             row = await cursor.fetchone()
             if row is None:
                 raise StaleLeaseError(f"stale lease for task {task_id}")
             await self._event(connection, row["run_id"], kind, task_id=task_id, payload=payload)
+            return row
 
     async def start_task(self, task_id: str, token: str) -> None:
         await self._transition_leased(task_id, token, "state='running'", (), "task.started")
 
     async def heartbeat(self, task_id: str, token: str, *, lease_for: timedelta) -> datetime:
-        expires = utcnow() + lease_for
-        await self._transition_leased(
-            task_id, token, "lease_expires_at=%s", (expires,), "task.heartbeat"
+        row = await self._transition_leased(
+            task_id,
+            token,
+            "lease_expires_at=clock_timestamp()+(%s * interval '1 second')",
+            (lease_for.total_seconds(),),
+            "task.heartbeat",
         )
-        return expires
+        return row["lease_expires_at"]
 
     async def release_task(self, task_id: str, token: str) -> None:
         await self._transition_leased(
             task_id,
             token,
-            "state='runnable',available_at=%s,lease_owner=NULL,lease_token=NULL,"
+            "state='runnable',available_at=clock_timestamp(),lease_owner=NULL,lease_token=NULL,"
             "lease_expires_at=NULL",
-            (utcnow(),),
+            (),
             "task.released",
         )
 
@@ -392,10 +371,10 @@ class PostgresBackend(OrchestrationBackend):
         async with self._pool.connection() as connection, connection.transaction():
             cursor = await connection.execute(
                 "UPDATE lp_tasks SET state='runnable',lease_owner=NULL,lease_token=NULL,"
-                "lease_expires_at=NULL,available_at=%s,updated_at=%s "
+                "lease_expires_at=NULL,available_at=clock_timestamp(),"
+                "updated_at=clock_timestamp() "
                 "WHERE state IN ('leased','running') "
-                "AND lease_expires_at<%s RETURNING id,run_id",
-                (utcnow(), utcnow(), utcnow()),
+                "AND lease_expires_at<clock_timestamp() RETURNING id,run_id",
             )
             rows = await cursor.fetchall()
             for row in rows:
@@ -494,30 +473,35 @@ class PostgresBackend(OrchestrationBackend):
     async def claim_trigger(
         self, name: str, owner: str, *, lease_for: timedelta = DEFAULT_TRIGGER_LEASE
     ) -> TriggerLease | None:
-        now = utcnow()
-        expires = now + lease_for
         token = new_id("trigger_lease")
         async with self._pool.connection() as connection, connection.transaction():
             await connection.execute(
-                "INSERT INTO lp_triggers (name,updated_at) VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                (name, now),
+                "INSERT INTO lp_triggers (name,updated_at) VALUES (%s,clock_timestamp()) "
+                "ON CONFLICT DO NOTHING",
+                (name,),
             )
             cursor = await connection.execute(
                 "UPDATE lp_triggers SET lease_owner=%s,lease_token=%s,"
-                "lease_expires_at=%s,updated_at=%s "
-                "WHERE name=%s AND (lease_token IS NULL OR lease_expires_at<=%s) RETURNING cursor",
-                (owner, token, expires, now, name, now),
+                "lease_expires_at=clock_timestamp()+(%s * interval '1 second'),"
+                "updated_at=clock_timestamp() WHERE name=%s "
+                "AND (lease_token IS NULL OR lease_expires_at<=clock_timestamp()) "
+                "RETURNING cursor,lease_expires_at",
+                (owner, token, lease_for.total_seconds(), name),
             )
             row = await cursor.fetchone()
-            return None if row is None else TriggerLease(name, token, row["cursor"], expires)
+            return (
+                None
+                if row is None
+                else TriggerLease(name, token, row["cursor"], row["lease_expires_at"])
+            )
 
     async def complete_trigger(self, name: str, token: str, cursor: Any) -> None:
         async with self._pool.connection() as connection:
             result = await connection.execute(
                 "UPDATE lp_triggers SET cursor=%s::jsonb,lease_owner=NULL,lease_token=NULL,"
-                "lease_expires_at=NULL,updated_at=%s WHERE name=%s AND lease_token=%s "
-                "AND lease_expires_at>%s",
-                (json.dumps(cursor), utcnow(), name, token, utcnow()),
+                "lease_expires_at=NULL,updated_at=clock_timestamp() "
+                "WHERE name=%s AND lease_token=%s AND lease_expires_at>clock_timestamp()",
+                (json.dumps(cursor), name, token),
             )
             if not result.rowcount:
                 raise StaleLeaseError(f"stale trigger lease for {name}")
@@ -526,8 +510,9 @@ class PostgresBackend(OrchestrationBackend):
         async with self._pool.connection() as connection:
             result = await connection.execute(
                 "UPDATE lp_triggers SET lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,"
-                "updated_at=%s WHERE name=%s AND lease_token=%s",
-                (utcnow(), name, token),
+                "updated_at=clock_timestamp() WHERE name=%s AND lease_token=%s "
+                "AND lease_expires_at>clock_timestamp()",
+                (name, token),
             )
             if not result.rowcount:
                 raise StaleLeaseError(f"stale trigger lease for {name}")

@@ -6,12 +6,15 @@ dynamic fan-out, durable at-least-once work delivery, and replaceable storage ba
 See [Project state and roadmap](docs/project-state-and-roadmap.md) for the current maturity of each
 subsystem, known gaps, and the recommended implementation sequence.
 
+For an operational walkthrough, see [Deploying pipelines with workers](docs/deploying-pipelines.md).
+
 The project currently includes:
 
 - a typed `@stage` / `@pipeline` graph DSL;
 - declarative `map` and `collect` operations;
 - a backend-neutral orchestration contract and in-memory implementation;
 - a Postgres adapter with task leases, fencing, retries, and append-only events;
+- versioned Alembic migrations and a reproducible split-process Compose deployment;
 - opt-in, TTL-bound result caching;
 - filesystem and S3-compatible artifact stores;
 - long-lived workers with supervised task subprocesses;
@@ -33,6 +36,27 @@ uv build
 ```
 
 Ruff owns formatting, import sorting, and linting. `ty` is the type checker and language server.
+
+## Installation
+
+Installing the wheel creates a `lightpipe` executable in the active Python environment. Keep the
+installation minimal or select only the integrations the deployment needs:
+
+```console
+pip install lightpipe
+pip install "lightpipe[api]"
+pip install "lightpipe[postgres]"
+pip install "lightpipe[api,postgres]"
+```
+
+The base package contains the DSL, runtime, in-memory backend, and CLI. `api` installs FastAPI and
+Uvicorn; `postgres` installs psycopg and Alembic. After installation, production commands run
+directly—`uv` is not required:
+
+```console
+lightpipe --help
+python -m lightpipe --help
+```
 
 ## Defining a pipeline
 
@@ -96,6 +120,13 @@ Pipeline code sees none of those implementation details.
 The in-memory backend provides matching execution behavior for tests and local development, without
 restart durability. Postgres is the first durable adapter:
 
+Initialize or upgrade its schema explicitly before starting services:
+
+```console
+lightpipe --backend postgresql://user:password@localhost/lightpipe db status
+lightpipe --backend postgresql://user:password@localhost/lightpipe db upgrade
+```
+
 ```python
 from lightpipe.backends.postgres import PostgresBackend
 
@@ -103,12 +134,19 @@ backend = PostgresBackend("postgresql://user:password@localhost/lightpipe")
 await backend.initialize()
 ```
 
+`initialize()` opens the pool and verifies that the schema is current; it never applies migrations.
+
 Workers are started with all pipeline definitions they are allowed to execute:
 
 ```console
-uv run lightpipe --backend postgresql://user:password@localhost/lightpipe worker \
+lightpipe --backend postgresql://user:password@localhost/lightpipe worker \
   examples.scrape_and_predict:scrape_and_predict
 ```
+
+For a durable split-process demo, run `docker compose up --build`, then open
+`http://127.0.0.1:8000`. This starts PostgreSQL 16, runs migrations once, launches a control-only
+API, and launches a separate worker. Use `docker compose down` to stop it; add `--volumes` only
+when you intentionally want to delete its database.
 
 Postgres notifications are only wake-up hints. Runnable task rows remain authoritative, so lost
 notifications cannot lose work. Task outputs must be JSON-compatible; larger data should be placed

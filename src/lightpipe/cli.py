@@ -5,6 +5,7 @@ import asyncio
 import dataclasses
 import importlib
 import json
+import signal
 import sys
 from contextlib import suppress
 from pathlib import Path
@@ -49,18 +50,28 @@ async def _run(args: argparse.Namespace) -> None:
 async def _worker(args: argparse.Namespace) -> None:
     backend = await load_backend(args.backend)
     runtime = Runtime(backend)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    supports_signals = hasattr(loop, "add_signal_handler")
+    if supports_signals:
+        loop.add_signal_handler(signal.SIGTERM, stop.set)
     try:
         for reference in args.pipeline:
             target = _object(reference)
             if not isinstance(target, Pipeline):
                 raise TypeError(f"{reference} is not a @pipeline object")
             runtime.register(target.compile())
-        worker = Worker(runtime, args.worker_id)
-        while True:
+        from datetime import timedelta
+
+        worker = Worker(runtime, args.worker_id, lease_for=timedelta(seconds=args.lease_seconds))
+        while not stop.is_set():
             await backend.reap_expired_leases()
             if not await worker.run_once():
-                await asyncio.sleep(args.poll_interval)
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=args.poll_interval)
     finally:
+        if supports_signals:
+            loop.remove_signal_handler(signal.SIGTERM)
         await backend.close()
 
 
@@ -114,6 +125,20 @@ async def _serve(args: argparse.Namespace) -> None:
         await service.stop()
 
 
+async def _database(args: argparse.Namespace) -> None:
+    from lightpipe.migration import database_status, upgrade_database
+
+    if args.database_command == "upgrade":
+        status = await asyncio.to_thread(upgrade_database, args.backend)
+    else:
+        status = await asyncio.to_thread(database_status, args.backend)
+    print(
+        json.dumps({"current": status.current, "head": status.head, "ready": status.current_schema})
+    )
+    if args.database_command == "status" and not status.current_schema:
+        raise SystemExit(1)
+
+
 def _load_definitions(
     references: list[str],
 ) -> tuple[dict[str, Pipeline], tuple[Poller | Schedule, ...]]:
@@ -151,11 +176,18 @@ def parser() -> argparse.ArgumentParser:
     worker.add_argument("pipeline", nargs="+", help="registered module:object pipelines")
     worker.add_argument("--worker-id", default="worker-1")
     worker.add_argument("--poll-interval", type=float, default=1.0)
+    worker.add_argument("--lease-seconds", type=float, default=300.0)
     worker.set_defaults(handler=_worker)
 
     inspect = commands.add_parser("inspect", help="show a run and its tasks")
     inspect.add_argument("run_id")
     inspect.set_defaults(handler=_inspect)
+
+    database = commands.add_parser("db", help="manage the Postgres schema")
+    database_commands = database.add_subparsers(dest="database_command", required=True)
+    database_commands.add_parser("status", help="show the current and required schema revisions")
+    database_commands.add_parser("upgrade", help="upgrade the schema to the latest revision")
+    database.set_defaults(handler=_database)
 
     serve = commands.add_parser("serve", help="launch the API, dashboard, and local workers")
     serve.add_argument(

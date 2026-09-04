@@ -4,19 +4,15 @@ Last updated: 2026-09-04
 
 ## Executive summary
 
-Lightpipe now has a working operational local service and the foundation of a distributed
-orchestrator. Pipeline authoring, dynamic fan-out, retries, caching, artifacts, leases, triggers,
-the backend abstraction, and the service lifecycle are implemented and tested through the
-in-memory backend. The package builds, the example pipeline runs from the CLI, and `lightpipe
-serve` launches the API, dashboard, reconciler, trigger scheduler, and local workers together.
+Lightpipe now has working local and durable Postgres deployment paths. Pipeline behavior is tested
+against both backends, versioned migrations replace schema bootstrap, and Compose runs the control
+API and workers as separate processes.
 
-It is not yet production-ready. In particular, the Postgres adapter has not been exercised against
-a live database, authentication is absent, and several operational and observability features
-remain incomplete.
+It is not yet production-ready. Authentication, structured logs and metrics, retention automation,
+and richer recovery controls remain incomplete.
 
-The next milestone is durable Postgres deployment. The same pipeline should run unchanged with the
-API and workers split across processes, backed by a live database and exercised under concurrency
-and worker-failure scenarios.
+The next milestone is monitoring and controls: make dynamic runs, attempts, failures, and recovery
+actions fully visible and operable from the API, CLI, and dashboard.
 
 ## Maturity definitions
 
@@ -29,13 +25,13 @@ and worker-failure scenarios.
 
 | Subsystem | Maturity | Current capability | Important gaps |
 | --- | --- | --- | --- |
-| Astral toolchain | Verified | `uv`, `uv_build`, Ruff, and `ty` are configured; the lockfile is committed-ready | CI workflow is not yet defined |
+| Astral toolchain | Verified | `uv`, `uv_build`, Ruff, `ty`, and GitHub Actions CI are configured | Broader Python/Postgres version matrices |
 | Pipeline DSL | Verified | `@stage`, `@pipeline`, deterministic graph compilation, parameters, and typed node results | More definition validation and richer complex-output typing |
 | Dynamic execution | Verified | Runtime `map`, terminal maps, `collect`, empty maps, and independent branch completion | Fan-out quotas, paging, and high-cardinality load tests |
 | Local orchestration | Verified | In-memory runs, task state, reconciliation, retries, cancellation, events, and cache | State intentionally does not survive restart |
-| Worker execution | Verified | Local draining, supervised Linux child-process execution, graceful service shutdown, and safe active-task release | Cross-process shutdown and fault-injection testing |
-| Backend abstraction | Verified foundation | Domain-level adapter contract, capabilities, entry-point loading, and conformance tests | Must be validated with a non-relational adapter |
-| Postgres backend | Implemented | Durable records, task claiming, leases, fencing, events, cache, and trigger cursors | No live Postgres integration, concurrency, migration, or fault-injection tests |
+| Worker execution | Verified | Supervised child execution, split-process deployment, graceful release, and killed-worker lease recovery | Network-partition and sustained-load testing |
+| Backend abstraction | Verified | Shared behavioral contract runs against memory and live Postgres | Must still be validated with a non-relational adapter |
+| Postgres backend | Verified | PostgreSQL 16, Alembic migrations, concurrency, fencing, events, cache, triggers, and worker-kill recovery | Sustained load and network-partition testing |
 | Result caching | Verified | Opt-in cache policy, deterministic keys, TTL expiry, and cross-run reuse | Manual invalidation controls and artifact-aware garbage collection |
 | Artifact storage | Verified locally | Content-addressed filesystem store and S3-compatible adapter | S3 integration tests, reference accounting, retention jobs, and pinning |
 | Triggers | Verified locally | Running interval schedules and stateful pollers with cursor leases and idempotent run requests | Cron expressions, webhook registry, overlap policies, and trigger history UI |
@@ -58,7 +54,7 @@ uv run pytest -q
 uv build
 ```
 
-The automated suite contains 21 passing tests covering:
+The automated suite contains 44 passing tests with Postgres enabled, covering:
 
 - linear DAG execution;
 - dynamic maps, collection, terminal maps, and empty maps;
@@ -72,6 +68,8 @@ The automated suite contains 21 passing tests covering:
 - poller cursors and schedule idempotency.
 - service startup/readiness, API submission, worker status, immediate triggers, and graceful task
   release during shutdown.
+- memory/Postgres conformance, concurrent claims and submissions, terminal-state fencing, and
+  split-process worker-kill recovery.
 
 The packaged CLI also passes an end-to-end run of
 `examples.scrape_and_predict:scrape_and_predict` using the in-memory backend.
@@ -98,7 +96,7 @@ uv run lightpipe serve examples.scrape_and_predict:scrape_and_predict
 starts a usable service at `http://127.0.0.1:8000`; a run submitted from the API or dashboard
 finishes without starting another process.
 
-### Milestone 2: Durable Postgres deployment
+### Milestone 2: Durable Postgres deployment — complete (2026-09-04)
 
 Goal: verify the backend contract under real multi-process execution.
 
@@ -170,10 +168,9 @@ runtime, worker, trigger, CLI, or API code.
 
 ## Recommended next step
 
-Begin Milestone 2 with a disposable live Postgres environment and run the shared backend
-conformance suite against it. Then exercise separate API and worker processes, concurrent claims,
-lease expiry, fencing, and deliberate worker termination. This validates the durable architecture
-before investing further in the dashboard.
+Begin Milestone 3 with an API model for task attempts and structured stage logs, then expose the
+compiled and dynamically expanded graph in the dashboard. Build retry controls only after attempt
+history is durable and observable.
 
 ## Explicit non-goals for the initial release
 

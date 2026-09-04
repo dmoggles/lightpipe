@@ -166,3 +166,7 @@ class StaleLeaseError(BackendError):
 
 class InvalidTransitionError(BackendError):
     pass
+
+
+class SchemaVersionError(BackendError):
+    pass

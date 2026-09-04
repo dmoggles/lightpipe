@@ -79,6 +79,10 @@ class MemoryBackend(OrchestrationBackend):
             run = self._runs[run_id]
             if run.state == state and (output is None or run.output == output):
                 return
+            if run.state in {RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELLED}:
+                raise InvalidTransitionError(
+                    f"run {run_id} is already terminal in state {run.state.value}"
+                )
             run.state = state
             run.updated_at = utcnow()
             run.output = output
@@ -214,7 +218,9 @@ class MemoryBackend(OrchestrationBackend):
             for task in self._tasks.values():
                 if task.run_id == run_id and not task.state.terminal:
                     task.state = TaskState.CANCELLED
+                    task.lease_owner = None
                     task.lease_token = None
+                    task.lease_expires_at = None
         await self.append_event(run_id, "run.cancelled")
 
     async def reap_expired_leases(self) -> int:

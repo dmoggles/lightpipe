@@ -37,6 +37,7 @@ async def execute_in_subprocess(
     *,
     timeout: float | None,
     heartbeat: Callable[[], Awaitable[None]] | None = None,
+    heartbeat_interval: float = 1.0,
 ) -> Any:
     """Execute a stage in a supervised Linux child process."""
     context = multiprocessing.get_context("fork")
@@ -61,7 +62,7 @@ async def execute_in_subprocess(
             now = loop.time()
             if timeout is not None and now - started >= timeout:
                 raise StageTimeoutError(f"stage exceeded its {timeout:g}s timeout")
-            if heartbeat is not None and now - last_heartbeat >= 1:
+            if heartbeat is not None and now - last_heartbeat >= heartbeat_interval:
                 await heartbeat()
                 last_heartbeat = now
             await asyncio.sleep(0.02)

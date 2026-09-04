@@ -41,6 +41,10 @@ backend = await load_backend("hazelcast://cluster.example/pipelines")
 The constructor receives the complete URL. If it exposes an asynchronous `initialize()` method,
 the loader invokes it before returning the backend.
 
+Backend initialization must not mutate a production schema. The Postgres adapter verifies its
+Alembic revision during initialization, while `lightpipe db upgrade` is the explicit schema-change
+boundary.
+
 ## Capability declaration
 
 Each adapter exposes `BackendCapabilities`:

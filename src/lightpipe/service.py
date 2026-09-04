@@ -50,8 +50,8 @@ class ServiceSupervisor:
         shutdown_grace: float = 10.0,
         owns_backend: bool = False,
     ) -> None:
-        if worker_count < 1:
-            raise ValueError("worker_count must be at least 1")
+        if worker_count < 0:
+            raise ValueError("worker_count cannot be negative")
         if poll_interval <= 0 or reconcile_interval <= 0:
             raise ValueError("service intervals must be positive")
         definition_names = [pipeline.name for pipeline in pipelines.values()]

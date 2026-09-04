@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 from datetime import timedelta
 
 import httpx
@@ -52,6 +54,23 @@ async def test_service_executes_submitted_pipeline() -> None:
         assert await wait_for_terminal(service.runtime, run.id) == RunState.SUCCEEDED
         assert (await backend.get_run(run.id)).output == 8
         assert service.snapshot()["workers"][0]["completed_tasks"] == 1
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_service_can_run_without_local_workers() -> None:
+    @pipeline
+    def flow():
+        return "waiting"
+
+    backend = MemoryBackend()
+    service = ServiceSupervisor(backend, {flow.name: flow}, worker_count=0)
+    await service.start()
+    try:
+        run = await service.runtime.submit(flow())
+        assert (await backend.get_run(run.id)).state == RunState.SUCCEEDED
+        assert service.snapshot()["workers"] == []
     finally:
         await service.stop()
 
@@ -158,3 +177,17 @@ def test_serve_command_defaults() -> None:
     assert args.host == "127.0.0.1"
     assert args.port == 8000
     assert args.workers == 1
+    worker = parser().parse_args(["worker", "module:flow", "--lease-seconds", "2"])
+    assert worker.lease_seconds == 2
+    database = parser().parse_args(["--backend", "postgresql://db/test", "db", "status"])
+    assert database.database_command == "status"
+
+
+def test_module_entrypoint() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "lightpipe", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "usage: lightpipe" in result.stdout

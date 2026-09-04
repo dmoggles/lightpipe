@@ -319,6 +319,8 @@ class Worker:
         lease_for: timedelta = DEFAULT_TASK_LEASE,
         process_isolation: bool = True,
     ) -> None:
+        if lease_for.total_seconds() < 0.1:
+            raise ValueError("worker lease duration must be at least 0.1 seconds")
         self.runtime = runtime
         self.backend = runtime.backend
         self.worker_id = worker_id
@@ -373,6 +375,7 @@ class Worker:
                     kwargs,
                     timeout=node.stage.timeout,
                     heartbeat=heartbeat,
+                    heartbeat_interval=min(1.0, self.lease_for.total_seconds() / 3),
                 )
             elif inspect.iscoroutinefunction(node.stage.function):
                 operation = node.stage.function(*args, **kwargs)
