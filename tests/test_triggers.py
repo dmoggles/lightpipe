@@ -18,7 +18,7 @@ from lightpipe import (
     schedule,
     webhook,
 )
-from lightpipe.triggers import CronExpression, trigger_record
+from lightpipe.triggers import CronExpression, Schedule, Webhook, trigger_record
 
 
 @pytest.mark.asyncio
@@ -216,6 +216,9 @@ def test_trigger_automation_example_definitions() -> None:
 
     assert pipelines["notification"].compile().name == "notification"
     heartbeat, weekday_morning, incoming_notification = triggers
+    assert isinstance(heartbeat, Schedule)
+    assert isinstance(weekday_morning, Schedule)
+    assert isinstance(incoming_notification, Webhook)
     assert heartbeat.interval == timedelta(seconds=10)
     assert weekday_morning.cron == "0 9 * * 1-5"
     assert incoming_notification.secret_env == "LIGHTPIPE_DEMO_WEBHOOK_SECRET"

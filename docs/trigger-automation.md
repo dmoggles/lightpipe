@@ -44,6 +44,7 @@ Cron schedules use standard five-field expressions and require an IANA timezone:
 ```python
 from lightpipe import MissedRunPolicy, OverlapPolicy, schedule
 
+
 @schedule(
     cron="0 9 * * 1-5",
     timezone="Europe/London",
@@ -80,6 +81,7 @@ exactly-once logical run creation, but stage side effects must still be idempote
 
 ```python
 from lightpipe import WebhookEvent, webhook
+
 
 @webhook(secret_env="PREDICTION_WEBHOOK_SECRET")
 def incoming(event: WebhookEvent):
