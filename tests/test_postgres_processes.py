@@ -64,7 +64,8 @@ def test_worker_kill_recovers_in_separate_processes(tmp_path: Path) -> None:
 
     with psycopg.connect(dsn) as connection:
         connection.execute(
-            "TRUNCATE lp_events,lp_expansions,lp_tasks,lp_runs,lp_cache,lp_triggers "
+            "TRUNCATE lp_stage_logs,lp_task_attempts,lp_events,lp_expansions,lp_tasks,"
+            "lp_runs,lp_cache,lp_triggers,lp_pipeline_definitions "
             "RESTART IDENTITY CASCADE"
         )
     with socket.socket() as listener:

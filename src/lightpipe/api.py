@@ -6,8 +6,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
+from importlib.resources import files
 from typing import Any
 
+from lightpipe.models import ArtifactRef, InvalidTransitionError, RunState
+from lightpipe.observability import span
 from lightpipe.runtime import Runtime
 from lightpipe.service import ServiceSupervisor, TriggerDefinition
 
@@ -18,6 +21,22 @@ def _json_default(value: Any) -> Any:
     if isinstance(value, (datetime, Enum)):
         return value.isoformat() if isinstance(value, datetime) else value.value
     raise TypeError(type(value).__name__)
+
+
+def _artifacts(value: Any, *, path: str = "$") -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if isinstance(value, ArtifactRef):
+        found.append({"path": path, **value.to_json()})
+    elif isinstance(value, dict):
+        if "$artifact" in value:
+            found.append({"path": path, **value})
+        else:
+            for key, item in value.items():
+                found.extend(_artifacts(item, path=f"{path}.{key}"))
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            found.extend(_artifacts(item, path=f"{path}[{index}]"))
+    return found
 
 
 def create_app(
@@ -31,8 +50,9 @@ def create_app(
     owns_backend: bool = False,
 ) -> Any:
     try:
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, Header, HTTPException
         from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+        from fastapi.staticfiles import StaticFiles
     except ImportError as error:
         raise RuntimeError("install lightpipe[api] to create the control API") from error
 
@@ -58,6 +78,16 @@ def create_app(
 
     app = FastAPI(title="lightpipe", version="0.2.0", lifespan=lifespan)
     app.state.lightpipe_service = service
+    dashboard_files = files("lightpipe").joinpath("dashboard")
+    app.mount("/assets", StaticFiles(directory=str(dashboard_files)), name="dashboard-assets")
+
+    @app.middleware("http")
+    async def trace_request(request: Any, call_next: Any) -> Any:
+        with span(
+            "lightpipe.http.request",
+            **{"http.request.method": request.method, "url.path": request.url.path},
+        ):
+            return await call_next(request)
 
     @app.get("/health/live")
     async def liveness() -> dict[str, str]:
@@ -120,108 +150,203 @@ def create_app(
         return {"status": "cancelled"}
 
     @app.get("/api/runs/{run_id}/events")
-    async def stream_events(run_id: str) -> StreamingResponse:
+    async def stream_events(
+        run_id: str, after: str | None = None, last_event_id: str | None = Header(None)
+    ) -> StreamingResponse:
         try:
             await runtime.backend.get_run(run_id)
         except KeyError as error:
             raise HTTPException(404, f"unknown run {run_id}") from error
 
         async def generate() -> AsyncIterator[str]:
-            async for event in runtime.backend.subscribe(run_id):
-                yield f"data: {json.dumps(event, default=_json_default)}\n\n"
+            async for event in runtime.backend.subscribe(run_id, after=after or last_event_id):
+                yield f"id: {event.id}\ndata: {json.dumps(event, default=_json_default)}\n\n"
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
+    def checked_limit(limit: int, maximum: int = 200) -> int:
+        if limit < 1 or limit > maximum:
+            raise HTTPException(422, f"limit must be between 1 and {maximum}")
+        return limit
+
+    async def run_detail(run_id: str) -> dict[str, Any]:
+        try:
+            run = await runtime.backend.get_run(run_id)
+        except KeyError as error:
+            raise HTTPException(404, f"unknown run {run_id}") from error
+        tasks = await runtime.backend.tasks_for_run(run_id)
+        attempts = await runtime.backend.attempts_for_run(run_id)
+        attempts_by_task: dict[str, list[Any]] = {}
+        for attempt in attempts:
+            attempts_by_task.setdefault(attempt.task_id, []).append(attempt)
+        definition = await runtime.backend.get_definition(run.definition_hash)
+        task_values: list[dict[str, Any]] = []
+        for task in tasks:
+            task_attempts = attempts_by_task.get(task.id, [])
+            value = task.public_dict()
+            value["attempts"] = task_attempts
+            value["history_complete"] = len(task_attempts) == task.attempt
+            value["artifacts"] = _artifacts(task.output, path="$.output")
+            task_values.append(value)
+        return {
+            "run": run,
+            "graph": None if definition is None else definition.graph,
+            "graph_available": definition is not None,
+            "tasks": task_values,
+            "artifacts": [
+                *_artifacts(run.parameters, path="$.parameters"),
+                *_artifacts(run.output, path="$.output"),
+            ],
+        }
+
+    @app.get("/api/v1/pipelines")
+    async def v1_pipelines(
+        limit: int = 100,
+        cursor: str | None = None,
+        name: str | None = None,
+        definition_hash: str | None = None,
+    ) -> dict[str, Any]:
+        checked_limit(limit)
+        if definition_hash is not None:
+            definition = await runtime.backend.get_definition(definition_hash)
+            items = (
+                []
+                if definition is None or (name is not None and definition.pipeline_name != name)
+                else [definition]
+            )
+            next_cursor = None
+        else:
+            items, next_cursor = await runtime.backend.list_definitions(
+                limit=limit, cursor=cursor, name=name
+            )
+        return {"items": items, "next_cursor": next_cursor}
+
+    @app.get("/api/v1/runs")
+    async def v1_runs(
+        limit: int = 100,
+        cursor: str | None = None,
+        pipeline: str | None = None,
+        definition_hash: str | None = None,
+        state: RunState | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+    ) -> dict[str, Any]:
+        if created_after and created_before and created_after > created_before:
+            raise HTTPException(422, "created_after must not be later than created_before")
+        if (created_after and created_after.tzinfo is None) or (
+            created_before and created_before.tzinfo is None
+        ):
+            raise HTTPException(422, "time filters must include a UTC offset")
+        items, next_cursor = await runtime.backend.query_runs(
+            limit=checked_limit(limit),
+            cursor=cursor,
+            pipeline_name=pipeline,
+            definition_hash=definition_hash,
+            state=state,
+            created_after=created_after,
+            created_before=created_before,
+        )
+        return {"items": items, "next_cursor": next_cursor}
+
+    @app.get("/api/v1/runs/{run_id}")
+    async def v1_run(run_id: str) -> dict[str, Any]:
+        return await run_detail(run_id)
+
+    @app.get("/api/v1/tasks/{task_id}/attempts")
+    async def v1_attempts(task_id: str) -> dict[str, Any]:
+        try:
+            attempts = await runtime.backend.attempts_for_task(task_id)
+            task = await runtime.backend.get_task(task_id)
+        except KeyError as error:
+            raise HTTPException(404, f"unknown task {task_id}") from error
+        return {"items": attempts, "history_complete": len(attempts) == task.attempt}
+
+    @app.get("/api/v1/tasks/{task_id}/logs")
+    async def v1_logs(
+        task_id: str,
+        attempt: int | None = None,
+        after: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        try:
+            items, next_cursor = await runtime.backend.logs_for_task(
+                task_id,
+                attempt=attempt,
+                after=after,
+                limit=checked_limit(limit, 1000),
+            )
+        except KeyError as error:
+            raise HTTPException(404, f"unknown task {task_id}") from error
+        return {"items": items, "next_cursor": next_cursor}
+
+    @app.get("/api/v1/tasks/{task_id}/logs/stream")
+    async def v1_log_stream(
+        task_id: str,
+        attempt: int | None = None,
+        after: str | None = None,
+        last_event_id: str | None = Header(None),
+    ) -> StreamingResponse:
+        try:
+            await runtime.backend.attempts_for_task(task_id)
+        except KeyError as error:
+            raise HTTPException(404, f"unknown task {task_id}") from error
+
+        async def generate_logs() -> AsyncIterator[str]:
+            async for record in runtime.backend.subscribe_logs(
+                task_id, attempt=attempt, after=after or last_event_id
+            ):
+                yield f"id: {record.id}\ndata: {json.dumps(record, default=_json_default)}\n\n"
+
+        return StreamingResponse(generate_logs(), media_type="text/event-stream")
+
+    @app.get("/api/v1/runs/{run_id}/events")
+    async def v1_events(
+        run_id: str, after: str | None = None, last_event_id: str | None = Header(None)
+    ) -> StreamingResponse:
+        try:
+            await runtime.backend.get_run(run_id)
+        except KeyError as error:
+            raise HTTPException(404, f"unknown run {run_id}") from error
+
+        async def generate_events() -> AsyncIterator[str]:
+            async for event in runtime.backend.subscribe(run_id, after=after or last_event_id):
+                yield f"id: {event.id}\ndata: {json.dumps(event, default=_json_default)}\n\n"
+
+        return StreamingResponse(generate_events(), media_type="text/event-stream")
+
+    async def control_error(operation: Any) -> Any:
+        try:
+            return await operation
+        except KeyError as error:
+            raise HTTPException(404, "run or task not found") from error
+        except InvalidTransitionError as error:
+            raise HTTPException(409, str(error)) from error
+
+    @app.post("/api/v1/runs/{run_id}/cancel", status_code=202)
+    async def v1_cancel(run_id: str) -> dict[str, str]:
+        await control_error(runtime.backend.cancel_run(run_id))
+        return {"status": "cancelled"}
+
+    @app.post("/api/v1/runs/{run_id}/rerun", status_code=202)
+    async def v1_rerun(run_id: str, body: dict[str, Any] | None = None) -> Any:
+        body = body or {}
+        try:
+            return await runtime.rerun(run_id, idempotency_key=body.get("idempotency_key"))
+        except KeyError as error:
+            raise HTTPException(404, f"unknown run {run_id}") from error
+        except RuntimeError as error:
+            raise HTTPException(409, str(error)) from error
+
+    @app.post("/api/v1/runs/{run_id}/retry-failed", status_code=202)
+    async def v1_retry(run_id: str, body: dict[str, Any] | None = None) -> Any:
+        body = body or {}
+        task_ids = body.get("task_ids", [])
+        if not isinstance(task_ids, list) or not all(isinstance(item, str) for item in task_ids):
+            raise HTTPException(422, "task_ids must be an array of task IDs")
+        return await control_error(runtime.retry_failed(run_id, task_ids=tuple(task_ids)))
+
     @app.get("/", response_class=HTMLResponse)
     async def dashboard() -> str:
-        return _DASHBOARD
+        return dashboard_files.joinpath("index.html").read_text(encoding="utf-8")
 
     return app
-
-
-_DASHBOARD = """<!doctype html>
-<html lang="en">
-<head>
-  <title>lightpipe</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-    body { margin: 0; background: #10151d; color: #e7edf5; }
-    main { max-width: 1100px; margin: auto; padding: 2rem; }
-    h1 { color: #8bd5ca; } h2 { margin-top: 2rem; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-    .card { background: #18202b; border: 1px solid #344052; border-radius: 8px; padding: 1rem; }
-    input, select, textarea, button { box-sizing: border-box; padding: .6rem; margin: .25rem 0; }
-    textarea { width: 100%; min-height: 6rem; font-family: monospace; }
-    button { cursor: pointer; background: #8bd5ca; color: #10151d; border: 0; border-radius: 4px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: .5rem; border-bottom: 1px solid #344052; }
-    a { color: #91d7e3; cursor: pointer; } pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-    .error, .failed { color: #ed8796; } .succeeded, .cached { color: #a6da95; }
-    @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
-  </style>
-</head>
-<body><main>
-  <h1>lightpipe</h1>
-  <div class="grid">
-    <section class="card">
-      <h2>Start a run</h2>
-      <select id="pipeline"></select>
-      <textarea id="parameters">{}</textarea>
-      <button id="submit">Run pipeline</button>
-      <div id="message"></div>
-    </section>
-    <section class="card"><h2>Service</h2><pre id="service">Loading…</pre></section>
-  </div>
-  <section class="card"><h2>Runs</h2><div id="runs">Loading…</div></section>
-  <section class="card"><h2>Run detail</h2><pre id="detail">Select a run.</pre></section>
-</main>
-<script>
-const replacements = {'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'};
-const esc = value => String(value).replace(/[&<>"']/g, c => replacements[c]);
-async function json(url, options) {
-  const response = await fetch(url, options); const body = await response.json();
-  if (!response.ok) throw new Error(body.detail || response.statusText); return body;
-}
-async function loadPipelines() {
-  const pipelines = await json('/api/pipelines');
-  const options = pipelines.map(p => `<option>${esc(p.name)}</option>`).join('');
-  document.querySelector('#pipeline').innerHTML = options;
-}
-async function loadService() {
-  const status = await json('/api/workers');
-  document.querySelector('#service').textContent = JSON.stringify(status, null, 2);
-}
-async function loadRuns() {
-  const runs = await json('/api/runs');
-  const rows = runs.map(r => `<tr><td>${esc(r.pipeline_name)}</td>` +
-    `<td><a data-run="${esc(r.id)}">${esc(r.id)}</a></td>` +
-    `<td class="${esc(r.state)}">${esc(r.state)}</td></tr>`).join('');
-  const header = '<table><tr><th>Pipeline</th><th>Run</th><th>State</th></tr>';
-  document.querySelector('#runs').innerHTML = header + rows + '</table>';
-  document.querySelectorAll('[data-run]').forEach(a => a.onclick = () => loadRun(a.dataset.run));
-}
-async function loadRun(id) {
-  const detail = await json(`/api/runs/${id}`);
-  document.querySelector('#detail').textContent = JSON.stringify(detail, null, 2);
-}
-document.querySelector('#submit').onclick = async () => {
-  const message = document.querySelector('#message');
-  try {
-    const parameters = JSON.parse(document.querySelector('#parameters').value);
-    const name = document.querySelector('#pipeline').value;
-    const options = {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({parameters})
-    };
-    const run = await json(`/api/pipelines/${encodeURIComponent(name)}/runs`, options);
-    message.className = ''; message.textContent = `Started ${run.id}`;
-    await loadRuns(); await loadRun(run.id);
-  } catch (error) { message.className = 'error'; message.textContent = error.message; }
-};
-async function refresh() {
-  try { await Promise.all([loadRuns(), loadService()]); } catch (error) { console.error(error); }
-}
-loadPipelines(); refresh(); setInterval(refresh, 1000);
-</script></body></html>"""

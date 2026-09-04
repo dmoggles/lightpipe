@@ -7,6 +7,8 @@ See [Project state and roadmap](docs/project-state-and-roadmap.md) for the curre
 subsystem, known gaps, and the recommended implementation sequence.
 
 For an operational walkthrough, see [Deploying pipelines with workers](docs/deploying-pipelines.md).
+For operator APIs, recovery semantics, and telemetry, see
+[Monitoring and recovery controls](docs/monitoring-and-controls.md).
 
 The project currently includes:
 
@@ -20,6 +22,8 @@ The project currently includes:
 - long-lived workers with supervised task subprocesses;
 - schedule and stateful-poller definitions;
 - a CLI and a runnable FastAPI monitoring/control service.
+- a bundled React operations dashboard with DAG, attempt, log, artifact, and recovery views;
+- optional OpenTelemetry traces, metrics, and correlated logs.
 
 ## Development
 
@@ -111,6 +115,23 @@ Pass additional `module:object` arguments to register pollers or schedules along
 Use `--workers N` for a larger local worker pool and `--no-process-isolation` when debugging stage
 functions in the server process. Run `uv run lightpipe serve --help` for all options.
 
+The versioned `/api/v1` endpoints provide cursor-paginated run and definition queries, task-attempt
+history, resumable event and log streams, cancellation, linked reruns, and in-place failed-task
+retry. Existing `/api` endpoints remain available for compatibility.
+
+The dashboard source is in `dashboard/`; its compiled assets are included in the Python wheel.
+Rebuild them after frontend changes:
+
+```console
+cd dashboard
+npm ci
+npm run build
+```
+
+OpenTelemetry export is disabled unless `LIGHTPIPE_OTEL_ENABLED=true` or an
+`OTEL_EXPORTER_OTLP_ENDPOINT` is configured. Install `opentelemetry-sdk` and
+`opentelemetry-exporter-otlp` in deployments that enable export.
+
 ## Backends
 
 `OrchestrationBackend` is a semantic boundary rather than a database CRUD interface. Adapters own
@@ -169,6 +190,6 @@ controls reuse; artifact retention is a separate concern.
 
 This initial implementation targets a single trusted operator. It does not provide multi-tenancy,
 RBAC, cyclic graphs, arbitrary topology mutation from stage code, or continuous record streaming.
-Cron-expression parsing, artifact reference garbage collection, retry-from-node, and richer graph
-visualization are follow-on operational work. Interval schedules and stateful pollers already keep
+Cron-expression parsing and artifact reference garbage collection are follow-on operational work.
+Interval schedules and stateful pollers already keep
 their ownership and cursor state in the selected orchestration backend.

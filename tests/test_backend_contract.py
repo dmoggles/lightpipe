@@ -14,6 +14,7 @@ from lightpipe.dsl import pipeline, stage
 from lightpipe.models import (
     CacheEntry,
     InvalidTransitionError,
+    PipelineDefinitionRecord,
     RunRecord,
     RunState,
     StaleLeaseError,
@@ -42,7 +43,8 @@ async def backend(request: pytest.FixtureRequest) -> AsyncIterator[Orchestration
     await value.initialize()
     async with value._pool.connection() as connection:
         await connection.execute(
-            "TRUNCATE lp_events,lp_expansions,lp_tasks,lp_runs,lp_cache,lp_triggers "
+            "TRUNCATE lp_stage_logs,lp_task_attempts,lp_events,lp_expansions,lp_tasks,"
+            "lp_runs,lp_cache,lp_triggers,lp_pipeline_definitions "
             "RESTART IDENTITY CASCADE"
         )
     try:
@@ -129,6 +131,32 @@ async def test_backend_contract_concurrent_idempotent_run_creation(
 
 
 @pytest.mark.asyncio
+async def test_backend_contract_definition_and_run_pagination(
+    backend: OrchestrationBackend,
+) -> None:
+    definition = PipelineDefinitionRecord("hash-one", "flow", {"nodes": []})
+    await backend.put_definition(definition)
+    assert await backend.get_definition("hash-one") == definition
+    definitions, definition_cursor = await backend.list_definitions(limit=1, name="flow")
+    assert [item.definition_hash for item in definitions] == ["hash-one"]
+    assert definition_cursor is None
+
+    now = utcnow()
+    first = await backend.create_run(
+        RunRecord(new_id("run"), "flow", "hash-one", {}, created_at=now - timedelta(seconds=1))
+    )
+    second = await backend.create_run(
+        RunRecord(new_id("run"), "flow", "hash-one", {}, created_at=now)
+    )
+    page, cursor = await backend.query_runs(limit=1, pipeline_name="flow")
+    assert [item.id for item in page] == [second.id]
+    assert cursor == second.id
+    remaining, final_cursor = await backend.query_runs(limit=1, cursor=cursor, pipeline_name="flow")
+    assert [item.id for item in remaining] == [first.id]
+    assert final_cursor is None
+
+
+@pytest.mark.asyncio
 async def test_backend_contract_concurrent_claims_are_disjoint(
     backend: OrchestrationBackend,
 ) -> None:
@@ -160,6 +188,50 @@ async def test_backend_contract_completion_and_event_are_atomic(
     assert any(event.kind == "task.succeeded" and event.task_id == task.id for event in events)
     with pytest.raises(StaleLeaseError):
         await backend.complete_task(task.id, lease.token, {"late": True})
+
+
+@pytest.mark.asyncio
+async def test_backend_contract_attempts_logs_and_retry(backend: OrchestrationBackend) -> None:
+    run = await backend.create_run(RunRecord(new_id("run"), "test", "hash", {}))
+    await backend.set_run_state(run.id, RunState.RUNNING)
+    task, _ = await backend.add_task(
+        TaskRecord(new_id("task"), run.id, "mapped", TaskState.RUNNABLE, map_index=2)
+    )
+    lease = (await backend.claim_tasks("worker-one"))[0]
+    await backend.start_task(task.id, lease.token)
+    logged = await backend.append_log(
+        task.id,
+        lease.token,
+        stream="log",
+        level="info",
+        logger="test.stage",
+        message="working",
+        fields={"item": 2},
+    )
+    await backend.fail_task(task.id, lease.token, "broken")
+    await backend.set_run_state(run.id, RunState.FAILED)
+
+    attempts = await backend.attempts_for_task(task.id)
+    logs, cursor = await backend.logs_for_task(task.id)
+    assert attempts[0].state.value == "failed"
+    assert attempts[0].worker_id == "worker-one"
+    assert attempts[0].error == "broken"
+    assert logs == [logged]
+    assert cursor is None
+    with pytest.raises(StaleLeaseError):
+        await backend.append_log(
+            task.id,
+            lease.token,
+            stream="stdout",
+            level="info",
+            message="late",
+        )
+
+    assert await backend.retry_failed(run.id, task_ids=(task.id,)) == 1
+    assert (await backend.get_run(run.id)).state == RunState.RUNNING
+    retried = (await backend.tasks_for_run(run.id))[0]
+    assert retried.state == TaskState.RUNNABLE
+    assert retried.error is None
 
 
 @pytest.mark.asyncio

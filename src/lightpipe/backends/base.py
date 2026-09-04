@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -9,8 +10,11 @@ from typing import Any
 from lightpipe.models import (
     CacheEntry,
     Event,
+    PipelineDefinitionRecord,
     RunRecord,
     RunState,
+    StageLogRecord,
+    TaskAttemptRecord,
     TaskLease,
     TaskRecord,
     TriggerLease,
@@ -46,6 +50,30 @@ class OrchestrationBackend(ABC):
     async def list_runs(self, *, limit: int = 100) -> list[RunRecord]: ...
 
     @abstractmethod
+    async def query_runs(
+        self,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        pipeline_name: str | None = None,
+        definition_hash: str | None = None,
+        state: RunState | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+    ) -> tuple[list[RunRecord], str | None]: ...
+
+    @abstractmethod
+    async def put_definition(self, definition: PipelineDefinitionRecord) -> None: ...
+
+    @abstractmethod
+    async def get_definition(self, definition_hash: str) -> PipelineDefinitionRecord | None: ...
+
+    @abstractmethod
+    async def list_definitions(
+        self, *, limit: int = 100, cursor: str | None = None, name: str | None = None
+    ) -> tuple[list[PipelineDefinitionRecord], str | None]: ...
+
+    @abstractmethod
     async def set_run_state(self, run_id: str, state: RunState, *, output: Any = None) -> None: ...
 
     @abstractmethod
@@ -53,6 +81,9 @@ class OrchestrationBackend(ABC):
 
     @abstractmethod
     async def tasks_for_run(self, run_id: str) -> list[TaskRecord]: ...
+
+    @abstractmethod
+    async def get_task(self, task_id: str) -> TaskRecord: ...
 
     @abstractmethod
     async def claim_tasks(
@@ -82,6 +113,54 @@ class OrchestrationBackend(ABC):
 
     @abstractmethod
     async def cancel_run(self, run_id: str) -> None: ...
+
+    @abstractmethod
+    async def retry_failed(self, run_id: str, *, task_ids: tuple[str, ...] = ()) -> int: ...
+
+    @abstractmethod
+    async def attempts_for_task(self, task_id: str) -> list[TaskAttemptRecord]: ...
+
+    @abstractmethod
+    async def attempts_for_run(self, run_id: str) -> list[TaskAttemptRecord]: ...
+
+    @abstractmethod
+    async def append_log(
+        self,
+        task_id: str,
+        token: str,
+        *,
+        stream: str,
+        level: str,
+        message: str,
+        logger: str | None = None,
+        fields: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+        span_id: str | None = None,
+    ) -> StageLogRecord: ...
+
+    @abstractmethod
+    async def logs_for_task(
+        self,
+        task_id: str,
+        *,
+        attempt: int | None = None,
+        after: str | None = None,
+        limit: int = 200,
+    ) -> tuple[list[StageLogRecord], str | None]: ...
+
+    async def subscribe_logs(
+        self, task_id: str, *, attempt: int | None = None, after: str | None = None
+    ) -> AsyncIterator[StageLogRecord]:
+        cursor = after
+        while True:
+            records, _ = await self.logs_for_task(task_id, attempt=attempt, after=cursor, limit=200)
+            for record in records:
+                cursor = record.id
+                yield record
+            attempts = await self.attempts_for_task(task_id)
+            if attempts and attempts[-1].finished_at is not None:
+                return
+            await asyncio.sleep(0.5)
 
     @abstractmethod
     async def reap_expired_leases(self) -> int: ...

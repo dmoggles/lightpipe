@@ -6,6 +6,6 @@ __pycache__/
 .ty/
 dist/
 build/
+dashboard/node_modules/
 *.egg-info/
 .lightpipe/
-

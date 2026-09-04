@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from lightpipe.backends.base import OrchestrationBackend
-from lightpipe.models import utcnow
+from lightpipe.models import PipelineDefinitionRecord, utcnow
 from lightpipe.runtime import Runtime, Worker
 from lightpipe.triggers import Poller, Schedule, TriggerRunner
 
@@ -94,7 +94,11 @@ class ServiceSupervisor:
         if not await self.backend.healthcheck():
             raise RuntimeError("orchestration backend is not ready")
         for pipeline in self.pipelines.values():
-            self.runtime.register(pipeline.compile())
+            graph = pipeline.compile()
+            self.runtime.register(graph)
+            await self.backend.put_definition(
+                PipelineDefinitionRecord(graph.definition_hash, graph.name, graph.public_dict())
+            )
         self.started = True
         self.stopping = False
         self._stop.clear()

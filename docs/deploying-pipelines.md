@@ -121,11 +121,16 @@ curl --fail --silent \
   http://127.0.0.1:8000/api/pipelines/derive/runs
 ```
 
-Use the returned run ID with `GET /api/runs/{run_id}`, `GET /api/runs/{run_id}/events`, or:
+Use the returned run ID with `GET /api/v1/runs/{run_id}`,
+`GET /api/v1/runs/{run_id}/events`, or:
 
 ```console
 lightpipe --backend "$DATABASE_URL" inspect RUN_ID
 ```
+
+Use `lightpipe retry-failed RUN_ID`, `lightpipe rerun RUN_ID`, or the matching dashboard controls
+for recovery. A failed-task retry reopens the original run and preserves successful mapped items;
+a rerun creates a new run linked to the original.
 
 An idempotency key is optional but recommended for externally retried submissions. Reusing the
 same key for the same pipeline returns the original run.

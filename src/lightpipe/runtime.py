@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
+import time
 import traceback
 from contextlib import suppress
 from dataclasses import asdict, is_dataclass
@@ -20,10 +22,11 @@ from lightpipe.dsl import (
     ParameterRef,
     PipelineInvocation,
 )
-from lightpipe.execution import execute_in_subprocess
+from lightpipe.execution import capture_structured_logs, execute_in_subprocess
 from lightpipe.models import (
     ArtifactRef,
     CacheEntry,
+    PipelineDefinitionRecord,
     RunRecord,
     RunState,
     StaleLeaseError,
@@ -33,6 +36,7 @@ from lightpipe.models import (
     new_id,
     utcnow,
 )
+from lightpipe.observability import add_metric, current_trace_ids, record_metric, span
 
 
 def _jsonable(value: Any) -> Any:
@@ -104,17 +108,31 @@ class Runtime:
     async def submit(
         self, invocation: PipelineInvocation, *, idempotency_key: str | None = None
     ) -> RunRecord:
+        with span("lightpipe.run.submit", pipeline=invocation.graph.name):
+            return await self._submit(invocation, idempotency_key=idempotency_key)
+
+    async def _submit(
+        self, invocation: PipelineInvocation, *, idempotency_key: str | None = None
+    ) -> RunRecord:
         graph = invocation.graph
+        add_metric("lightpipe.run.submissions", pipeline=graph.name)
         self.register(graph)
+        await self.backend.put_definition(
+            PipelineDefinitionRecord(graph.definition_hash, graph.name, graph.public_dict())
+        )
         parameters = _ensure_inline_size(
             _jsonable(invocation.parameters), self.backend.capabilities.max_inline_bytes
         )
+        trace_id, span_id = current_trace_ids()
         run = RunRecord(
             new_id("run"),
             graph.name,
             graph.definition_hash,
             parameters,
             idempotency_key=idempotency_key,
+            trace_context=(
+                None if trace_id is None else {"trace_id": trace_id, "span_id": span_id or ""}
+            ),
         )
         stored = await self.backend.create_run(run)
         if stored.id != run.id:
@@ -122,6 +140,31 @@ class Runtime:
         await self.backend.set_run_state(run.id, RunState.RUNNING)
         await self.reconcile(run.id)
         return await self.backend.get_run(run.id)
+
+    async def rerun(self, run_id: str, *, idempotency_key: str | None = None) -> RunRecord:
+        original = await self.backend.get_run(run_id)
+        graph = self.definition_for(original)
+        await self.backend.put_definition(
+            PipelineDefinitionRecord(graph.definition_hash, graph.name, graph.public_dict())
+        )
+        run = RunRecord(
+            new_id("run"),
+            original.pipeline_name,
+            original.definition_hash,
+            original.parameters,
+            idempotency_key=idempotency_key,
+            rerun_of=original.id,
+            trace_context=original.trace_context,
+        )
+        stored = await self.backend.create_run(run)
+        if stored.id == run.id:
+            await self.backend.set_run_state(run.id, RunState.RUNNING)
+            await self.reconcile(run.id)
+        return await self.backend.get_run(stored.id)
+
+    async def retry_failed(self, run_id: str, *, task_ids: tuple[str, ...] = ()) -> RunRecord:
+        await self.backend.retry_failed(run_id, task_ids=task_ids)
+        return await self.reconcile(run_id)
 
     def definition_for(self, run: RunRecord) -> GraphDefinition:
         try:
@@ -180,11 +223,17 @@ class Runtime:
             return value[map_index] if mapped_source and map_index is not None else value
         if isinstance(binding, (MappedRef, CollectedRef)):
             matches = await self._node_tasks(tasks, binding.node_id)
-            values = [
-                _from_jsonable(task.output)
-                for task in matches
-                if task.state in {TaskState.SUCCEEDED, TaskState.CACHED}
+            successful = [
+                task for task in matches if task.state in {TaskState.SUCCEEDED, TaskState.CACHED}
             ]
+            if mapped_source and map_index is not None and isinstance(binding, MappedRef):
+                match = next((task for task in successful if task.map_index == map_index), None)
+                if match is None:
+                    raise RuntimeError(
+                        f"mapped node {binding.node_id} has no output at index {map_index}"
+                    )
+                return _from_jsonable(match.output)
+            values = [_from_jsonable(task.output) for task in successful]
             if mapped_source and map_index is not None:
                 return values[map_index]
             return values
@@ -203,13 +252,26 @@ class Runtime:
             }
         return value
 
-    async def _map_values(self, source: Any, run: RunRecord, tasks: list[TaskRecord]) -> list[Any]:
+    async def _map_items(
+        self, source: Any, run: RunRecord, tasks: list[TaskRecord]
+    ) -> list[tuple[int, Any]]:
+        if isinstance(source, MappedRef):
+            matches = await self._node_tasks(tasks, source.node_id)
+            return [
+                (task.map_index if task.map_index is not None else index, task.output)
+                for index, task in enumerate(matches)
+                if task.state in {TaskState.SUCCEEDED, TaskState.CACHED}
+            ]
         value = await self._binding_value(source, run, tasks)
         if isinstance(value, (str, bytes, dict)) or not hasattr(value, "__iter__"):
             raise TypeError("mapped input must be a collection other than str, bytes, or dict")
-        return list(value)
+        return list(enumerate(value))
 
     async def reconcile(self, run_id: str) -> RunRecord:
+        with span("lightpipe.reconcile", **{"lightpipe.run_id": run_id}):
+            return await self._reconcile(run_id)
+
+    async def _reconcile(self, run_id: str) -> RunRecord:
         run = await self.backend.get_run(run_id)
         if run.state in {RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELLED}:
             return run
@@ -222,13 +284,11 @@ class Runtime:
                 continue
             existing = await self._node_tasks(tasks, node.id)
             if node.mapped:
-                if await self.backend.expansion_count(run_id, node.id) is not None:
-                    continue
                 if failed_dependency and not isinstance(node.args[0], MappedRef):
                     await self.backend.mark_expanded(run_id, node.id, 0)
                     continue
-                values = await self._map_values(node.args[0], run, tasks)
-                for index in range(len(values)):
+                items = await self._map_items(node.args[0], run, tasks)
+                for index, _ in items:
                     task = TaskRecord(
                         new_id("task"), run_id, node.id, TaskState.RUNNABLE, map_index=index
                     )
@@ -237,7 +297,7 @@ class Runtime:
                         tasks.append(added)
                 # Mark only after idempotently creating every item. A crash before this point
                 # causes harmless re-expansion rather than permanently losing mapped tasks.
-                await self.backend.mark_expanded(run_id, node.id, len(values))
+                await self.backend.mark_expanded(run_id, node.id, len(items))
             elif not existing and not failed_dependency:
                 task = TaskRecord(new_id("task"), run_id, node.id, TaskState.RUNNABLE)
                 added, created = await self.backend.add_task(task)
@@ -258,10 +318,16 @@ class Runtime:
         if all_expanded and all_normal_created and all(task.state.terminal for task in tasks):
             if any(task.state == TaskState.FAILED for task in tasks):
                 await self.backend.set_run_state(run_id, RunState.FAILED)
+                add_metric(
+                    "lightpipe.run.completions", pipeline=run.pipeline_name, outcome="failed"
+                )
             else:
                 output = await self._structure_value(graph.outputs, run, tasks)
                 await self.backend.set_run_state(
                     run_id, RunState.SUCCEEDED, output=_jsonable(output)
+                )
+                add_metric(
+                    "lightpipe.run.completions", pipeline=run.pipeline_name, outcome="succeeded"
                 )
         return await self.backend.get_run(run_id)
 
@@ -350,6 +416,29 @@ class Worker:
         return True
 
     async def execute(self, lease: TaskLease) -> None:
+        started_at = time.monotonic()
+        record_metric(
+            "lightpipe.task.queue_latency",
+            max(0.0, (utcnow() - lease.task.created_at).total_seconds()),
+            node=lease.task.node_id,
+        )
+        with span(
+            "lightpipe.task.attempt",
+            **{
+                "lightpipe.run_id": lease.task.run_id,
+                "lightpipe.task_id": lease.task.id,
+                "lightpipe.node_id": lease.task.node_id,
+                "lightpipe.attempt": lease.task.attempt,
+            },
+        ):
+            await self._execute(lease)
+        record_metric(
+            "lightpipe.task.duration",
+            time.monotonic() - started_at,
+            node=lease.task.node_id,
+        )
+
+    async def _execute(self, lease: TaskLease) -> None:
         task = lease.task
         await self.backend.start_task(task.id, lease.token)
         node, args, kwargs = await self.runtime.resolve_task(task)
@@ -362,6 +451,7 @@ class Worker:
                     await self.backend.complete_task(
                         task.id, lease.token, cached.output, cached=True
                     )
+                    add_metric("lightpipe.task.cache_hits", node=node.id)
                     await self.runtime.reconcile(task.run_id)
                     return
             if self.process_isolation:
@@ -369,31 +459,58 @@ class Worker:
                 async def heartbeat() -> None:
                     await self.backend.heartbeat(task.id, lease.token, lease_for=self.lease_for)
 
-                operation = execute_in_subprocess(
+                async def persist_log(message: dict[str, Any]) -> None:
+                    trace_id, span_id = current_trace_ids()
+                    message.update(trace_id=trace_id, span_id=span_id)
+                    await self.backend.append_log(task.id, lease.token, **message)
+                    logging.getLogger("lightpipe.stage").log(
+                        getattr(logging, str(message["level"]).upper(), logging.INFO),
+                        str(message["message"]),
+                        extra={
+                            "lightpipe.run_id": task.run_id,
+                            "lightpipe.task_id": task.id,
+                            "lightpipe.attempt": task.attempt,
+                            "lightpipe.stream": message["stream"],
+                            **dict(message.get("fields", {})),
+                        },
+                    )
+
+                result = await execute_in_subprocess(
                     node.stage.function,
                     args,
                     kwargs,
                     timeout=node.stage.timeout,
                     heartbeat=heartbeat,
+                    log=persist_log,
                     heartbeat_interval=min(1.0, self.lease_for.total_seconds() / 3),
                 )
-            elif inspect.iscoroutinefunction(node.stage.function):
-                operation = node.stage.function(*args, **kwargs)
             else:
-                result = node.stage.function(*args, **kwargs)
-
-                async def completed() -> Any:
-                    return result
-
-                operation = completed()
-            if node.stage.timeout is not None and not self.process_isolation:
-                result = await asyncio.wait_for(operation, timeout=node.stage.timeout)
-            else:
-                result = await operation
+                captured_error: BaseException | None = None
+                with capture_structured_logs() as captured:
+                    try:
+                        if inspect.iscoroutinefunction(node.stage.function):
+                            operation = node.stage.function(*args, **kwargs)
+                            if node.stage.timeout is not None:
+                                result = await asyncio.wait_for(
+                                    operation, timeout=node.stage.timeout
+                                )
+                            else:
+                                result = await operation
+                        else:
+                            result = node.stage.function(*args, **kwargs)
+                    except BaseException as error:
+                        captured_error = error
+                for message in captured:
+                    trace_id, span_id = current_trace_ids()
+                    message.update(trace_id=trace_id, span_id=span_id)
+                    await self.backend.append_log(task.id, lease.token, **message)
+                if captured_error is not None:
+                    raise captured_error
             result = _ensure_inline_size(
                 _jsonable(result), self.backend.capabilities.max_inline_bytes
             )
             await self.backend.complete_task(task.id, lease.token, result)
+            add_metric("lightpipe.task.completions", node=node.id, outcome="succeeded")
             if cache_key is not None and node.stage.cache is not None:
                 await self.backend.put_cache(
                     CacheEntry(cache_key, result, utcnow() + node.stage.cache.ttl)
@@ -413,4 +530,9 @@ class Worker:
             else:
                 retry_at = None
             await self.backend.fail_task(task.id, lease.token, text, retry_at=retry_at)
+            add_metric(
+                "lightpipe.task.completions",
+                node=node.id,
+                outcome="retry" if retry_at else "failed",
+            )
         await self.runtime.reconcile(task.run_id)

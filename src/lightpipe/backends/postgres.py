@@ -14,13 +14,17 @@ from lightpipe.backends.base import (
 )
 from lightpipe.migration import HEAD_REVISION
 from lightpipe.models import (
+    AttemptState,
     CacheEntry,
     Event,
     InvalidTransitionError,
+    PipelineDefinitionRecord,
     RunRecord,
     RunState,
     SchemaVersionError,
+    StageLogRecord,
     StaleLeaseError,
+    TaskAttemptRecord,
     TaskLease,
     TaskRecord,
     TaskState,
@@ -100,15 +104,51 @@ class PostgresBackend(OrchestrationBackend):
     @staticmethod
     def _run(row: dict[str, Any]) -> RunRecord:
         return RunRecord(
+            id=row["id"],
+            pipeline_name=row["pipeline_name"],
+            definition_hash=row["definition_hash"],
+            parameters=row["parameters"],
+            state=RunState(row["state"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            idempotency_key=row["idempotency_key"],
+            output=row["output"],
+            rerun_of=row.get("rerun_of"),
+            trace_context=row.get("trace_context"),
+        )
+
+    @staticmethod
+    def _attempt(row: dict[str, Any]) -> TaskAttemptRecord:
+        return TaskAttemptRecord(
+            id=row["id"],
+            task_id=row["task_id"],
+            run_id=row["run_id"],
+            attempt=row["attempt"],
+            worker_id=row["worker_id"],
+            state=AttemptState(row["state"]),
+            leased_at=row["leased_at"],
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+            error=row["error"],
+            cache_hit=row["cache_hit"],
+        )
+
+    @staticmethod
+    def _log(row: dict[str, Any]) -> StageLogRecord:
+        return StageLogRecord(
             row["id"],
-            row["pipeline_name"],
-            row["definition_hash"],
-            row["parameters"],
-            RunState(row["state"]),
-            row["created_at"],
-            row["updated_at"],
-            row["idempotency_key"],
-            row["output"],
+            row["sequence"],
+            row["run_id"],
+            row["task_id"],
+            row["attempt"],
+            row["occurred_at"],
+            row["stream"],
+            row["level"],
+            row["logger"],
+            row["message"],
+            row["fields"],
+            row["trace_id"],
+            row["span_id"],
         )
 
     @staticmethod
@@ -140,7 +180,9 @@ class PostgresBackend(OrchestrationBackend):
                 else ""
             )
             cursor = await connection.execute(
-                "INSERT INTO lp_runs VALUES (%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s) "
+                "INSERT INTO lp_runs (id,pipeline_name,definition_hash,parameters,state,output,"
+                "idempotency_key,created_at,updated_at,rerun_of,trace_context) "
+                "VALUES (%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb) "
                 f"{conflict}RETURNING *",
                 (
                     run.id,
@@ -152,6 +194,8 @@ class PostgresBackend(OrchestrationBackend):
                     run.idempotency_key,
                     run.created_at,
                     run.updated_at,
+                    run.rerun_of,
+                    json.dumps(run.trace_context),
                 ),
             )
             row = await cursor.fetchone()
@@ -178,6 +222,101 @@ class PostgresBackend(OrchestrationBackend):
                 "SELECT * FROM lp_runs ORDER BY created_at DESC LIMIT %s", (limit,)
             )
             return [self._run(row) for row in await cursor.fetchall()]
+
+    async def query_runs(
+        self,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        pipeline_name: str | None = None,
+        definition_hash: str | None = None,
+        state: RunState | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+    ) -> tuple[list[RunRecord], str | None]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        for clause, value in (
+            ("pipeline_name=%s", pipeline_name),
+            ("definition_hash=%s", definition_hash),
+            ("state=%s", None if state is None else state.value),
+            ("created_at>=%s", created_after),
+            ("created_at<=%s", created_before),
+        ):
+            if value is not None:
+                clauses.append(clause)
+                values.append(value)
+        if cursor is not None:
+            clauses.append("(created_at,id)<(SELECT created_at,id FROM lp_runs WHERE id=%s)")
+            values.append(cursor)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        async with self._pool.connection() as connection:
+            result = await connection.execute(
+                f"SELECT * FROM lp_runs {where} ORDER BY created_at DESC,id DESC LIMIT %s",
+                (*values, limit + 1),
+            )
+            rows = await result.fetchall()
+        next_cursor = rows[limit - 1]["id"] if len(rows) > limit else None
+        return [self._run(row) for row in rows[:limit]], next_cursor
+
+    async def put_definition(self, definition: PipelineDefinitionRecord) -> None:
+        async with self._pool.connection() as connection:
+            await connection.execute(
+                "INSERT INTO lp_pipeline_definitions "
+                "(definition_hash,pipeline_name,graph,created_at) VALUES (%s,%s,%s::jsonb,%s) "
+                "ON CONFLICT (definition_hash) DO NOTHING",
+                (
+                    definition.definition_hash,
+                    definition.pipeline_name,
+                    json.dumps(definition.graph),
+                    definition.created_at,
+                ),
+            )
+
+    async def get_definition(self, definition_hash: str) -> PipelineDefinitionRecord | None:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                "SELECT * FROM lp_pipeline_definitions WHERE definition_hash=%s",
+                (definition_hash,),
+            )
+            row = await cursor.fetchone()
+        return (
+            None
+            if row is None
+            else PipelineDefinitionRecord(
+                row["definition_hash"], row["pipeline_name"], row["graph"], row["created_at"]
+            )
+        )
+
+    async def list_definitions(
+        self, *, limit: int = 100, cursor: str | None = None, name: str | None = None
+    ) -> tuple[list[PipelineDefinitionRecord], str | None]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if name is not None:
+            clauses.append("pipeline_name=%s")
+            values.append(name)
+        if cursor is not None:
+            clauses.append(
+                "(created_at,definition_hash)<(SELECT created_at,definition_hash "
+                "FROM lp_pipeline_definitions WHERE definition_hash=%s)"
+            )
+            values.append(cursor)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        async with self._pool.connection() as connection:
+            result = await connection.execute(
+                "SELECT * FROM lp_pipeline_definitions "
+                f"{where} ORDER BY created_at DESC,definition_hash DESC LIMIT %s",
+                (*values, limit + 1),
+            )
+            rows = await result.fetchall()
+        next_cursor = rows[limit - 1]["definition_hash"] if len(rows) > limit else None
+        return [
+            PipelineDefinitionRecord(
+                row["definition_hash"], row["pipeline_name"], row["graph"], row["created_at"]
+            )
+            for row in rows[:limit]
+        ], next_cursor
 
     async def set_run_state(self, run_id: str, state: RunState, *, output: Any = None) -> None:
         async with self._pool.connection() as connection, connection.transaction():
@@ -247,6 +386,14 @@ class PostgresBackend(OrchestrationBackend):
             )
             return [self._task(row) for row in await cursor.fetchall()]
 
+    async def get_task(self, task_id: str) -> TaskRecord:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute("SELECT * FROM lp_tasks WHERE id=%s", (task_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            return self._task(row)
+
     async def claim_tasks(
         self, worker_id: str, *, limit: int = 1, lease_for: timedelta = DEFAULT_TASK_LEASE
     ) -> list[TaskLease]:
@@ -263,6 +410,18 @@ class PostgresBackend(OrchestrationBackend):
             )
             rows = await cursor.fetchall()
             for row in rows:
+                await connection.execute(
+                    "INSERT INTO lp_task_attempts "
+                    "(id,task_id,run_id,attempt,worker_id,state,leased_at) "
+                    "VALUES (%s,%s,%s,%s,%s,'leased',clock_timestamp())",
+                    (
+                        new_id("attempt"),
+                        row["id"],
+                        row["run_id"],
+                        row["attempt"],
+                        worker_id,
+                    ),
+                )
                 await self._event(connection, row["run_id"], "task.leased", task_id=row["id"])
         return [
             TaskLease(self._task(row), row["lease_token"], row["lease_expires_at"]) for row in rows
@@ -282,12 +441,43 @@ class PostgresBackend(OrchestrationBackend):
             cursor = await connection.execute(
                 f"UPDATE lp_tasks SET {assignments},updated_at=clock_timestamp() "
                 "WHERE id=%s AND lease_token=%s AND lease_expires_at>=clock_timestamp() "
-                "AND state IN ('leased','running') RETURNING run_id,lease_expires_at",
+                "AND state IN ('leased','running') RETURNING run_id,attempt,lease_expires_at",
                 (*values, task_id, token),
             )
             row = await cursor.fetchone()
             if row is None:
                 raise StaleLeaseError(f"stale lease for task {task_id}")
+            attempt_state: str | None = None
+            cache_hit = False
+            error: str | None = None
+            finished = False
+            if kind == "task.started":
+                attempt_state = "running"
+            elif kind == "task.released":
+                attempt_state, finished = "released", True
+            elif kind == "task.succeeded":
+                attempt_state, finished = "succeeded", True
+            elif kind == "task.cached":
+                attempt_state, finished, cache_hit = "cached", True, True
+            elif kind in {"task.failed", "task.retry_scheduled"}:
+                attempt_state, finished = "failed", True
+                error = None if payload is None else str(payload.get("error"))
+            if attempt_state is not None:
+                await connection.execute(
+                    "UPDATE lp_task_attempts SET state=%s,"
+                    "started_at=CASE WHEN %s='running' THEN clock_timestamp() ELSE started_at END,"
+                    "finished_at=CASE WHEN %s THEN clock_timestamp() ELSE finished_at END,"
+                    "error=%s,cache_hit=%s WHERE task_id=%s AND attempt=%s",
+                    (
+                        attempt_state,
+                        attempt_state,
+                        finished,
+                        error,
+                        cache_hit,
+                        task_id,
+                        row["attempt"],
+                    ),
+                )
             await self._event(connection, row["run_id"], kind, task_id=task_id, payload=payload)
             return row
 
@@ -358,14 +548,169 @@ class PostgresBackend(OrchestrationBackend):
                 (utcnow(), run_id),
             )
             if await cursor.fetchone() is None:
-                raise InvalidTransitionError(f"run {run_id} is already terminal or missing")
-            await connection.execute(
+                existing = await connection.execute(
+                    "SELECT state FROM lp_runs WHERE id=%s", (run_id,)
+                )
+                if await existing.fetchone() is None:
+                    raise KeyError(run_id)
+                raise InvalidTransitionError(f"run {run_id} is already terminal")
+            tasks = await connection.execute(
                 "UPDATE lp_tasks SET state='cancelled',lease_token=NULL,lease_owner=NULL,"
                 "lease_expires_at=NULL,updated_at=%s WHERE run_id=%s "
-                "AND state NOT IN ('succeeded','failed','cancelled','cached','skipped')",
+                "AND state NOT IN ('succeeded','failed','cancelled','cached','skipped') "
+                "RETURNING id,attempt",
                 (utcnow(), run_id),
             )
+            for task in await tasks.fetchall():
+                await connection.execute(
+                    "UPDATE lp_task_attempts SET state='cancelled',finished_at=clock_timestamp() "
+                    "WHERE task_id=%s AND attempt=%s AND finished_at IS NULL",
+                    (task["id"], task["attempt"]),
+                )
             await self._event(connection, run_id, "run.cancelled")
+
+    async def retry_failed(self, run_id: str, *, task_ids: tuple[str, ...] = ()) -> int:
+        async with self._pool.connection() as connection, connection.transaction():
+            cursor = await connection.execute(
+                "SELECT state FROM lp_runs WHERE id=%s FOR UPDATE", (run_id,)
+            )
+            run = await cursor.fetchone()
+            if run is None:
+                raise KeyError(run_id)
+            if run["state"] != "failed":
+                raise InvalidTransitionError(f"run {run_id} is not failed")
+            if task_ids:
+                cursor = await connection.execute(
+                    "SELECT id FROM lp_tasks WHERE run_id=%s AND id=ANY(%s) AND state='failed' "
+                    "FOR UPDATE",
+                    (run_id, list(task_ids)),
+                )
+                rows = await cursor.fetchall()
+                if {row["id"] for row in rows} != set(task_ids):
+                    raise InvalidTransitionError(
+                        "all selected tasks must be failed tasks in the run"
+                    )
+            else:
+                cursor = await connection.execute(
+                    "SELECT id FROM lp_tasks WHERE run_id=%s AND state='failed' FOR UPDATE",
+                    (run_id,),
+                )
+                rows = await cursor.fetchall()
+            if not rows:
+                raise InvalidTransitionError("run has no failed tasks to retry")
+            selected = [row["id"] for row in rows]
+            await connection.execute(
+                "UPDATE lp_tasks SET state='runnable',error=NULL,output=NULL,"
+                "available_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=ANY(%s)",
+                (selected,),
+            )
+            await connection.execute(
+                "UPDATE lp_runs SET state='running',output=NULL,updated_at=clock_timestamp() "
+                "WHERE id=%s",
+                (run_id,),
+            )
+            await self._event(
+                connection, run_id, "run.retry_started", payload={"task_ids": selected}
+            )
+            return len(selected)
+
+    async def attempts_for_task(self, task_id: str) -> list[TaskAttemptRecord]:
+        async with self._pool.connection() as connection:
+            exists = await connection.execute("SELECT 1 FROM lp_tasks WHERE id=%s", (task_id,))
+            if await exists.fetchone() is None:
+                raise KeyError(task_id)
+            cursor = await connection.execute(
+                "SELECT * FROM lp_task_attempts WHERE task_id=%s ORDER BY attempt", (task_id,)
+            )
+            return [self._attempt(row) for row in await cursor.fetchall()]
+
+    async def attempts_for_run(self, run_id: str) -> list[TaskAttemptRecord]:
+        async with self._pool.connection() as connection:
+            exists = await connection.execute("SELECT 1 FROM lp_runs WHERE id=%s", (run_id,))
+            if await exists.fetchone() is None:
+                raise KeyError(run_id)
+            cursor = await connection.execute(
+                "SELECT * FROM lp_task_attempts WHERE run_id=%s ORDER BY task_id,attempt",
+                (run_id,),
+            )
+            return [self._attempt(row) for row in await cursor.fetchall()]
+
+    async def append_log(
+        self,
+        task_id: str,
+        token: str,
+        *,
+        stream: str,
+        level: str,
+        message: str,
+        logger: str | None = None,
+        fields: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+        span_id: str | None = None,
+    ) -> StageLogRecord:
+        async with self._pool.connection() as connection, connection.transaction():
+            cursor = await connection.execute(
+                "SELECT run_id,attempt FROM lp_tasks WHERE id=%s AND lease_token=%s "
+                "AND lease_expires_at>=clock_timestamp() AND state IN ('leased','running') "
+                "FOR UPDATE",
+                (task_id, token),
+            )
+            task = await cursor.fetchone()
+            if task is None:
+                raise StaleLeaseError(f"stale lease for task {task_id}")
+            log_id = new_id("log")
+            cursor = await connection.execute(
+                "INSERT INTO lp_stage_logs "
+                "(id,run_id,task_id,attempt,occurred_at,stream,level,logger,message,fields,"
+                "trace_id,span_id) VALUES "
+                "(%s,%s,%s,%s,clock_timestamp(),%s,%s,%s,%s,%s::jsonb,%s,%s) "
+                "RETURNING *",
+                (
+                    log_id,
+                    task["run_id"],
+                    task_id,
+                    task["attempt"],
+                    stream,
+                    level,
+                    logger,
+                    message,
+                    json.dumps(fields or {}),
+                    trace_id,
+                    span_id,
+                ),
+            )
+            row = await cursor.fetchone()
+            await connection.execute("SELECT pg_notify('lightpipe_logs', %s)", (task_id,))
+            return self._log(row)
+
+    async def logs_for_task(
+        self,
+        task_id: str,
+        *,
+        attempt: int | None = None,
+        after: str | None = None,
+        limit: int = 200,
+    ) -> tuple[list[StageLogRecord], str | None]:
+        clauses = ["task_id=%s"]
+        values: list[Any] = [task_id]
+        if attempt is not None:
+            clauses.append("attempt=%s")
+            values.append(attempt)
+        if after is not None:
+            clauses.append("sequence>(SELECT sequence FROM lp_stage_logs WHERE id=%s)")
+            values.append(after)
+        async with self._pool.connection() as connection:
+            exists = await connection.execute("SELECT 1 FROM lp_tasks WHERE id=%s", (task_id,))
+            if await exists.fetchone() is None:
+                raise KeyError(task_id)
+            cursor = await connection.execute(
+                f"SELECT * FROM lp_stage_logs WHERE {' AND '.join(clauses)} "
+                "ORDER BY sequence LIMIT %s",
+                (*values, limit + 1),
+            )
+            rows = await cursor.fetchall()
+        next_cursor = rows[limit - 1]["id"] if len(rows) > limit else None
+        return [self._log(row) for row in rows[:limit]], next_cursor
 
     async def reap_expired_leases(self) -> int:
         async with self._pool.connection() as connection, connection.transaction():
@@ -374,10 +719,16 @@ class PostgresBackend(OrchestrationBackend):
                 "lease_expires_at=NULL,available_at=clock_timestamp(),"
                 "updated_at=clock_timestamp() "
                 "WHERE state IN ('leased','running') "
-                "AND lease_expires_at<clock_timestamp() RETURNING id,run_id",
+                "AND lease_expires_at<clock_timestamp() RETURNING id,run_id,attempt",
             )
             rows = await cursor.fetchall()
             for row in rows:
+                await connection.execute(
+                    "UPDATE lp_task_attempts SET state='lease_expired',"
+                    "finished_at=clock_timestamp() WHERE task_id=%s AND attempt=%s "
+                    "AND finished_at IS NULL",
+                    (row["id"], row["attempt"]),
+                )
                 await self._event(
                     connection, row["run_id"], "task.lease_expired", task_id=row["id"]
                 )

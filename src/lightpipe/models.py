@@ -47,6 +47,17 @@ class TaskState(StrEnum):
         }
 
 
+class AttemptState(StrEnum):
+    LEASED = "leased"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CACHED = "cached"
+    RELEASED = "released"
+    LEASE_EXPIRED = "lease_expired"
+    CANCELLED = "cancelled"
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactRef:
     uri: str
@@ -107,6 +118,8 @@ class RunRecord:
     updated_at: datetime = field(default_factory=utcnow)
     idempotency_key: str | None = None
     output: Any = None
+    rerun_of: str | None = None
+    trace_context: dict[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -138,6 +151,46 @@ class TaskLease:
     task: TaskRecord
     token: str
     expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineDefinitionRecord:
+    definition_hash: str
+    pipeline_name: str
+    graph: dict[str, Any]
+    created_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass(slots=True)
+class TaskAttemptRecord:
+    id: str
+    task_id: str
+    run_id: str
+    attempt: int
+    worker_id: str
+    state: AttemptState = AttemptState.LEASED
+    leased_at: datetime = field(default_factory=utcnow)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error: str | None = None
+    cache_hit: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class StageLogRecord:
+    id: str
+    sequence: int
+    run_id: str
+    task_id: str
+    attempt: int
+    occurred_at: datetime
+    stream: str
+    level: str
+    logger: str | None
+    message: str
+    fields: dict[str, JsonValue] = field(default_factory=dict)
+    trace_id: str | None = None
+    span_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

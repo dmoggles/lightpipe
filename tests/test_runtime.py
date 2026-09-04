@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import timedelta
 
 import pytest
 
-from lightpipe import CachePolicy, MemoryBackend, RunState, Runtime, TaskState, pipeline, stage
+from lightpipe import (
+    CachePolicy,
+    MemoryBackend,
+    RunState,
+    Runtime,
+    TaskState,
+    Worker,
+    pipeline,
+    stage,
+)
 from lightpipe.models import StaleLeaseError
 
 
@@ -110,6 +120,36 @@ async def test_retry_and_failure() -> None:
     assert result.output == "ok"
     assert attempts == 2
     assert any(event.kind == "task.retry_scheduled" for event in await backend.events(run.id))
+
+
+@pytest.mark.asyncio
+async def test_stage_stdout_stderr_and_structured_logs_are_persisted() -> None:
+    import sys
+
+    @stage
+    def noisy() -> str:
+        print("hello stdout")
+        print("hello stderr", file=sys.stderr)
+        logging.getLogger("pipeline.noisy").warning("structured", extra={"item": 7})
+        return "done"
+
+    @pipeline
+    def flow():
+        return noisy()
+
+    backend = MemoryBackend()
+    runtime = Runtime(backend)
+    run = await runtime.submit(flow())
+    worker = Worker(runtime, "capture", process_isolation=True)
+    assert await worker.run_once() is True
+    task = (await backend.tasks_for_run(run.id))[0]
+    logs, _ = await backend.logs_for_task(task.id, limit=20)
+    assert [(item.stream, item.message) for item in logs] == [
+        ("stdout", "hello stdout"),
+        ("stderr", "hello stderr"),
+        ("log", "structured"),
+    ]
+    assert logs[-1].fields["item"] == 7
 
 
 @pytest.mark.asyncio

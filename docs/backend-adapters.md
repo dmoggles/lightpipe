@@ -20,10 +20,20 @@ An adapter must provide the following guarantees:
 9. Trigger leases provide the same fencing behavior as task leases and persist their cursor only on
    successful completion.
 10. Cache publication is safe under concurrent writers, and expired entries are never returned.
+11. Every successful task claim creates one durable attempt record in the same atomic operation;
+    fenced lifecycle transitions finish only that attempt.
+12. Stage logs are append-only, ordered per task, attributed to an attempt, and accepted only from
+    the current unexpired fencing token.
+13. Failed-task retry atomically reopens the run and selected failed tasks without changing
+    successful task identities or their attempt history.
+14. Serializable pipeline graph definitions remain available by definition hash for historical
+    inspection and linked reruns.
 
 The core deliberately reconciles downstream scheduling after task completion. Reconciliation is
 idempotent and workers run it when idle, closing the crash window between committing a result and
 creating its downstream tasks without requiring a distributed transaction across backend types.
+Mapped-to-mapped edges retain the originating map index, allowing a recovered item to add its
+missing downstream work without repeating successful siblings.
 
 ## Plugin registration
 

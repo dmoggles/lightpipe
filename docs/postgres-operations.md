@@ -47,7 +47,8 @@ Worker execution is at least once. A killed worker retains its lease until expir
 returns the task to runnable state. Fencing prevents the former worker from committing after a
 replacement claims the task. External stage writes must therefore be idempotent.
 
-Run, task, event, cache, and trigger rows are currently retained indefinitely, except that expired
+Run, task, attempt, stage-log, event, cache, and trigger rows are currently retained indefinitely,
+except that expired
 cache entries are removed on lookup. Until retention jobs arrive in Milestone 5, monitor database
 growth and perform only operator-reviewed archival. Do not delete records belonging to retained
 runs.
