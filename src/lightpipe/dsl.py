@@ -74,6 +74,42 @@ class GraphDefinition:
     parameters: tuple[str, ...]
     definition_hash: str
 
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "definition_hash": self.definition_hash,
+            "parameters": list(self.parameters),
+            "nodes": [
+                {
+                    "id": node.id,
+                    "stage": node.stage.name,
+                    "stage_hash": node.stage.definition_hash,
+                    "dependencies": sorted(node.dependencies),
+                    "mapped": node.mapped,
+                    "map_arg": node.map_arg,
+                    "retry": {
+                        "attempts": node.stage.retry.attempts,
+                        "initial_delay": node.stage.retry.initial_delay,
+                        "multiplier": node.stage.retry.multiplier,
+                        "maximum_delay": node.stage.retry.maximum_delay,
+                    },
+                    "timeout": node.stage.timeout,
+                    "cache": (
+                        None
+                        if node.stage.cache is None
+                        else {
+                            "ttl_seconds": node.stage.cache.ttl.total_seconds(),
+                            "version": node.stage.cache.version,
+                        }
+                    ),
+                    "args": _canonical_binding(node.args),
+                    "kwargs": _canonical_binding(node.kwargs),
+                }
+                for node in self.nodes.values()
+            ],
+            "outputs": _canonical_binding(self.outputs),
+        }
+
 
 @dataclass(slots=True)
 class _GraphBuilder:

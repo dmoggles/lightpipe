@@ -1,7 +1,17 @@
 from lightpipe.artifacts import ArtifactStore, FileArtifactStore, S3ArtifactStore
 from lightpipe.backends import BackendCapabilities, MemoryBackend, OrchestrationBackend
 from lightpipe.dsl import MappedRef, NodeRef, Pipeline, PipelineInvocation, Stage, pipeline, stage
-from lightpipe.models import ArtifactRef, CachePolicy, RetryPolicy, RunState, TaskState
+from lightpipe.models import (
+    ArtifactRef,
+    AttemptState,
+    CachePolicy,
+    PipelineDefinitionRecord,
+    RetryPolicy,
+    RunState,
+    StageLogRecord,
+    TaskAttemptRecord,
+    TaskState,
+)
 from lightpipe.runtime import Runtime, Worker
 from lightpipe.service import ServiceSupervisor
 from lightpipe.triggers import (
@@ -17,6 +27,7 @@ from lightpipe.triggers import (
 __all__ = [
     "ArtifactRef",
     "ArtifactStore",
+    "AttemptState",
     "BackendCapabilities",
     "CachePolicy",
     "FileArtifactStore",
@@ -25,6 +36,7 @@ __all__ = [
     "NodeRef",
     "OrchestrationBackend",
     "Pipeline",
+    "PipelineDefinitionRecord",
     "PipelineInvocation",
     "PollResult",
     "Poller",
@@ -36,6 +48,8 @@ __all__ = [
     "Schedule",
     "ServiceSupervisor",
     "Stage",
+    "StageLogRecord",
+    "TaskAttemptRecord",
     "TaskState",
     "TriggerRunner",
     "Worker",

@@ -8,11 +8,11 @@ Lightpipe now has working local and durable Postgres deployment paths. Pipeline 
 against both backends, versioned migrations replace schema bootstrap, and Compose runs the control
 API and workers as separate processes.
 
-It is not yet production-ready. Authentication, structured logs and metrics, retention automation,
-and richer recovery controls remain incomplete.
+It is not yet production-ready. Authentication, retention automation, trigger management, and
+sustained-load hardening remain incomplete.
 
-The next milestone is monitoring and controls: make dynamic runs, attempts, failures, and recovery
-actions fully visible and operable from the API, CLI, and dashboard.
+The next milestone is trigger automation: add cron and webhook triggers, overlap policies,
+pause/resume controls, missed-run handling, and trigger history.
 
 ## Maturity definitions
 
@@ -35,10 +35,10 @@ actions fully visible and operable from the API, CLI, and dashboard.
 | Result caching | Verified | Opt-in cache policy, deterministic keys, TTL expiry, and cross-run reuse | Manual invalidation controls and artifact-aware garbage collection |
 | Artifact storage | Verified locally | Content-addressed filesystem store and S3-compatible adapter | S3 integration tests, reference accounting, retention jobs, and pinning |
 | Triggers | Verified locally | Running interval schedules and stateful pollers with cursor leases and idempotent run requests | Cron expressions, webhook registry, overlap policies, and trigger history UI |
-| CLI | Verified | Local `run`, durable `worker`, `inspect`, and operational `serve` commands | Retry, trigger-management, and garbage-collection commands |
-| Control API | Verified locally | Managed lifespan, pipeline/run endpoints, cancellation, event streaming, health, and worker status | Authentication, pagination, and live Postgres deployment testing |
-| Dashboard | Verified locally | Launchable run submission, run list/detail, and service status | Graph, logs, attempts, richer filters, and controls |
-| Observability | Foundation | Append-only orchestration events and SSE transport | Structured stage logs, metrics, traces, and OpenTelemetry export |
+| CLI | Verified | Local/durable execution, inspection, filtered runs, cancel, rerun, and retry-failed commands | Trigger-management and garbage-collection commands |
+| Control API | Verified locally | Versioned pagination/filtering, graph/attempt/log views and streams, recovery controls, health, and worker status | Authentication and live Postgres deployment testing |
+| Dashboard | Verified locally | Bundled React UI with DAG, mapped items, attempts, live logs, artifacts, filters, and recovery controls | Trigger history and high-cardinality graph virtualization |
+| Observability | Implemented | Durable structured stage logs plus optional correlated OpenTelemetry traces, metrics, and logs | Collector integration and sustained-volume tests |
 | Production controls | Planned | Basic lease and retry primitives exist | Priorities, quotas, backpressure, backfills, retention workers, and recovery tooling |
 
 ## Verified baseline
@@ -54,7 +54,7 @@ uv run pytest -q
 uv build
 ```
 
-The automated suite contains 44 passing tests with Postgres enabled, covering:
+The automated suite contains 53 tests with Postgres enabled, covering:
 
 - linear DAG execution;
 - dynamic maps, collection, terminal maps, and empty maps;
@@ -70,6 +70,9 @@ The automated suite contains 44 passing tests with Postgres enabled, covering:
   release during shutdown.
 - memory/Postgres conformance, concurrent claims and submissions, terminal-state fencing, and
   split-process worker-kill recovery.
+- durable graph definitions, attempt lifecycle and timings, fenced stage logs, pagination, linked
+  reruns, and in-place recovery of failed mapped items.
+- versioned monitoring APIs, bundled dashboard assets, and optional observability configuration.
 
 The packaged CLI also passes an end-to-end run of
 `examples.scrape_and_predict:scrape_and_predict` using the in-memory backend.
@@ -112,7 +115,7 @@ Goal: verify the backend contract under real multi-process execution.
 Acceptance criteria: the example pipeline runs unchanged through separate API and worker processes;
 intentional worker termination may repeat a task but cannot lose it or accept a stale completion.
 
-### Milestone 3: Monitoring and controls
+### Milestone 3: Monitoring and controls — complete (2026-09-04)
 
 Goal: make run behavior understandable and recoverable without querying storage directly.
 
@@ -168,9 +171,9 @@ runtime, worker, trigger, CLI, or API code.
 
 ## Recommended next step
 
-Begin Milestone 3 with an API model for task attempts and structured stage logs, then expose the
-compiled and dynamically expanded graph in the dashboard. Build retry controls only after attempt
-history is durable and observable.
+Begin Milestone 4 with cron expressions that have explicit IANA time zones and tested daylight-
+saving behavior. Add overlap and missed-run policies before exposing trigger pause/resume and
+history controls in the dashboard.
 
 ## Explicit non-goals for the initial release
 

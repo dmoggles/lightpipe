@@ -75,3 +75,12 @@ def test_migration_adopts_legacy_bootstrap_schema() -> None:
             row = connection.execute("SELECT to_regclass('lp_tasks')").fetchone()
             assert row is not None
             assert row[0] == "lp_tasks"
+            monitoring = connection.execute(
+                "SELECT to_regclass('lp_pipeline_definitions'),"
+                "to_regclass('lp_task_attempts'),to_regclass('lp_stage_logs')"
+            ).fetchone()
+            assert monitoring == (
+                "lp_pipeline_definitions",
+                "lp_task_attempts",
+                "lp_stage_logs",
+            )

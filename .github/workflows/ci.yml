@@ -25,6 +25,16 @@ jobs:
       LIGHTPIPE_TEST_POSTGRES_DSN: postgresql://lightpipe:lightpipe@127.0.0.1:5432/lightpipe_test
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+        working-directory: dashboard
+      - run: npm run build
+        working-directory: dashboard
+      - run: git diff --exit-code -- src/lightpipe/dashboard
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true

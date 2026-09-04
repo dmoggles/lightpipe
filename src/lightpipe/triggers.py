@@ -10,6 +10,7 @@ from datetime import timedelta
 from typing import Any
 
 from lightpipe.dsl import PipelineInvocation
+from lightpipe.observability import add_metric, span
 from lightpipe.runtime import Runtime, _jsonable
 
 
@@ -89,40 +90,48 @@ class TriggerRunner:
         if lease is None:
             return 0
         try:
-            result = definition.function(lease.cursor)
-            if inspect.isawaitable(result):
-                result = await result
-            if not isinstance(result, PollResult):
-                raise TypeError("poller functions must return PollResult")
-            for index, request in enumerate(result.requests):
-                await self.runtime.submit(
-                    request.invocation,
-                    idempotency_key=self._request_key(
-                        definition.name, lease.cursor, index, request
-                    ),
-                )
-            await self.backend.complete_trigger(definition.name, lease.token, result.cursor)
-            return len(result.requests)
+            with span("lightpipe.trigger", trigger=definition.name, kind="poller"):
+                return await self._run_poller(definition, lease)
         except BaseException:
             await self.backend.fail_trigger(definition.name, lease.token)
             raise
+
+    async def _run_poller(self, definition: Poller, lease: Any) -> int:
+        result = definition.function(lease.cursor)
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, PollResult):
+            raise TypeError("poller functions must return PollResult")
+        for index, request in enumerate(result.requests):
+            await self.runtime.submit(
+                request.invocation,
+                idempotency_key=self._request_key(definition.name, lease.cursor, index, request),
+            )
+        await self.backend.complete_trigger(definition.name, lease.token, result.cursor)
+        add_metric("lightpipe.trigger.runs", len(result.requests), trigger=definition.name)
+        return len(result.requests)
 
     async def run_schedule_once(self, definition: Schedule) -> bool:
         lease = await self.backend.claim_trigger(definition.name, self.owner)
         if lease is None:
             return False
         try:
-            seconds = definition.interval.total_seconds()
-            bucket = int(time.time() // seconds)
-            if lease.cursor == bucket:
-                await self.backend.complete_trigger(definition.name, lease.token, bucket)
-                return False
-            prefix = definition.idempotency_prefix or f"schedule:{definition.name}"
-            await self.runtime.submit(
-                definition.invocation_factory(), idempotency_key=f"{prefix}:{bucket}"
-            )
-            await self.backend.complete_trigger(definition.name, lease.token, bucket)
-            return True
+            with span("lightpipe.trigger", trigger=definition.name, kind="schedule"):
+                return await self._run_schedule(definition, lease)
         except BaseException:
             await self.backend.fail_trigger(definition.name, lease.token)
             raise
+
+    async def _run_schedule(self, definition: Schedule, lease: Any) -> bool:
+        seconds = definition.interval.total_seconds()
+        bucket = int(time.time() // seconds)
+        if lease.cursor == bucket:
+            await self.backend.complete_trigger(definition.name, lease.token, bucket)
+            return False
+        prefix = definition.idempotency_prefix or f"schedule:{definition.name}"
+        await self.runtime.submit(
+            definition.invocation_factory(), idempotency_key=f"{prefix}:{bucket}"
+        )
+        await self.backend.complete_trigger(definition.name, lease.token, bucket)
+        add_metric("lightpipe.trigger.runs", trigger=definition.name)
+        return True

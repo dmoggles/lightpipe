@@ -170,6 +170,72 @@ async def test_api_lifecycle_and_run_submission() -> None:
         assert detail["run"]["output"] == 4
         assert (await client.get("/api/workers")).json()["workers"]
         assert "Start a run" in (await client.get("/")).text
+        assert (await client.get("/assets/app.js")).status_code == 200
+
+        page = (await client.get("/api/v1/runs", params={"state": "succeeded"})).json()
+        assert page["items"][0]["id"] == run_id
+        assert page["next_cursor"] is None
+        detail = (await client.get(f"/api/v1/runs/{run_id}")).json()
+        assert detail["graph_available"] is True
+        assert detail["graph"]["nodes"][0]["stage"] == "increment"
+        assert detail["tasks"][0]["attempts"][0]["state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_api_retries_failed_mapped_item_in_place() -> None:
+    failed_once: set[int] = set()
+    saved: list[int] = []
+
+    @stage
+    def sometimes(value: int) -> int:
+        if value == 2 and value not in failed_once:
+            failed_once.add(value)
+            raise ValueError("try again")
+        return value * 2
+
+    @stage
+    def save(value: int) -> None:
+        saved.append(value)
+
+    @pipeline
+    def flow(values: list[int]):
+        return save.map(sometimes.map(values))
+
+    runtime = Runtime(MemoryBackend())
+    app = create_app(runtime, {flow.name: flow}, process_isolation=False, worker_count=1)
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
+    ):
+        response = await client.post(
+            f"/api/pipelines/{flow.name}/runs", json={"parameters": {"values": [1, 2, 3]}}
+        )
+        run_id = response.json()["id"]
+        assert await wait_for_terminal(runtime, run_id) == RunState.FAILED
+        before = (await client.get(f"/api/v1/runs/{run_id}")).json()
+        failed = next(
+            task
+            for task in before["tasks"]
+            if task["node_id"].startswith("sometimes") and task["state"] == "failed"
+        )
+        succeeded = {
+            task["id"]
+            for task in before["tasks"]
+            if task["node_id"].startswith("sometimes") and task["state"] == "succeeded"
+        }
+        assert saved == [2, 6]
+        retry = await client.post(
+            f"/api/v1/runs/{run_id}/retry-failed", json={"task_ids": [failed["id"]]}
+        )
+        assert retry.status_code == 202
+        assert await wait_for_terminal(runtime, run_id) == RunState.SUCCEEDED
+        after = (await client.get(f"/api/v1/runs/{run_id}")).json()
+        assert {task["id"] for task in after["tasks"] if task["id"] in succeeded} == succeeded
+        retried = next(task for task in after["tasks"] if task["id"] == failed["id"])
+        assert len(retried["attempts"]) == 2
+        assert sorted(saved) == [2, 4, 6]
+        assert len(saved) == 3
 
 
 def test_serve_command_defaults() -> None:
@@ -181,6 +247,10 @@ def test_serve_command_defaults() -> None:
     assert worker.lease_seconds == 2
     database = parser().parse_args(["--backend", "postgresql://db/test", "db", "status"])
     assert database.database_command == "status"
+    retry = parser().parse_args(["retry-failed", "run_1", "--task-id", "task_1"])
+    assert retry.task_id == ["task_1"]
+    runs = parser().parse_args(["runs", "--state", "failed", "--limit", "25"])
+    assert runs.limit == 25
 
 
 def test_module_entrypoint() -> None:
