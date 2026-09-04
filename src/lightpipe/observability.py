@@ -20,18 +20,33 @@ def configure_observability() -> bool:
     if not requested or _enabled:
         return _enabled
     try:
-        from opentelemetry import metrics, trace
-        from opentelemetry._logs import set_logger_provider
-        from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
-        from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-        from opentelemetry.sdk.metrics import MeterProvider
-        from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-        from opentelemetry.sdk.resources import Resource
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry import metrics, trace  # ty: ignore[unresolved-import]
+        from opentelemetry._logs import set_logger_provider  # ty: ignore[unresolved-import]
+        from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (  # ty: ignore[unresolved-import]
+            OTLPLogExporter,
+        )
+        from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (  # ty: ignore[unresolved-import]
+            OTLPMetricExporter,
+        )
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (  # ty: ignore[unresolved-import]
+            OTLPSpanExporter,
+        )
+        from opentelemetry.sdk._logs import (  # ty: ignore[unresolved-import]
+            LoggerProvider,
+            LoggingHandler,
+        )
+        from opentelemetry.sdk._logs.export import (  # ty: ignore[unresolved-import]
+            BatchLogRecordProcessor,
+        )
+        from opentelemetry.sdk.metrics import MeterProvider  # ty: ignore[unresolved-import]
+        from opentelemetry.sdk.metrics.export import (  # ty: ignore[unresolved-import]
+            PeriodicExportingMetricReader,
+        )
+        from opentelemetry.sdk.resources import Resource  # ty: ignore[unresolved-import]
+        from opentelemetry.sdk.trace import TracerProvider  # ty: ignore[unresolved-import]
+        from opentelemetry.sdk.trace.export import (  # ty: ignore[unresolved-import]
+            BatchSpanProcessor,
+        )
     except ImportError as error:
         raise RuntimeError(
             "OpenTelemetry export was requested; install opentelemetry-sdk and "
@@ -91,7 +106,7 @@ def record_metric(name: str, value: float, **attributes: Any) -> None:
 def current_trace_ids() -> tuple[str | None, str | None]:
     if not _enabled:
         return None, None
-    from opentelemetry import trace
+    from opentelemetry import trace  # ty: ignore[unresolved-import]
 
     context = trace.get_current_span().get_span_context()
     if not context.is_valid:
