@@ -1,6 +1,6 @@
 # Project state and roadmap
 
-Last updated: 2026-09-04
+Last updated: 2026-09-05
 
 ## Executive summary
 
@@ -11,8 +11,8 @@ API and workers as separate processes.
 It is not yet production-ready. General control-plane authentication, retention automation, and
 sustained-load hardening remain incomplete.
 
-The next milestone is storage and execution hardening: retention, concurrency controls,
-backpressure, backfills, draining, and load testing.
+Storage and execution hardening is now implemented. The next milestone is the backend portability
+proof through a limited Hazelcast adapter and the shared conformance suite.
 
 ## Maturity definitions
 
@@ -39,7 +39,7 @@ backpressure, backfills, draining, and load testing.
 | Control API | Verified locally | Versioned pagination/filtering, graph/attempt/log views and streams, recovery controls, health, and worker status | Authentication and live Postgres deployment testing |
 | Dashboard | Verified locally | Bundled React UI with run recovery plus trigger state, history, linked runs, and pause/resume | High-cardinality graph virtualization |
 | Observability | Implemented | Durable structured stage logs plus optional correlated OpenTelemetry traces, metrics, and logs | Collector integration and sustained-volume tests |
-| Production controls | Planned | Basic lease and retry primitives exist | Priorities, quotas, backpressure, backfills, retention workers, and recovery tooling |
+| Production controls | Verified locally | Retention, artifact GC/pins, admission limits, priorities, rate limits, backpressure, backfills, draining, and recovery tooling | Sustained production-volume and network-partition testing |
 
 ## Verified baseline
 
@@ -54,7 +54,7 @@ uv run pytest -q
 uv build
 ```
 
-The automated suite contains 65 tests, covering:
+The automated suite contains 72 tests, covering:
 
 - linear DAG execution;
 - dynamic maps, collection, terminal maps, and empty maps;
@@ -145,7 +145,7 @@ Goal: operate scheduled scraping and event-driven prediction workflows without e
 Acceptance criteria: a poller detects a new scrape target exactly once logically, advances its
 cursor safely, and launches a monitored pipeline run after scheduler or worker restarts.
 
-### Milestone 5: Storage and execution hardening
+### Milestone 5: Storage and execution hardening — complete (2026-09-05)
 
 Goal: bound resource use and support sustained operation.
 
@@ -173,8 +173,8 @@ runtime, worker, trigger, CLI, or API code.
 
 ## Recommended next step
 
-Begin Milestone 5 with explicit retention policies and reference-safe artifact garbage collection,
-then add global and per-pipeline concurrency limits before load testing mixed workloads.
+Begin Milestone 6 with the limited Hazelcast adapter and use the expanded backend contract to find
+and remove any remaining Postgres-specific orchestration assumptions.
 
 ## Explicit non-goals for the initial release
 

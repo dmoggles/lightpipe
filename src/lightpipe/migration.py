@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from importlib.resources import files
 
-HEAD_REVISION = "0003"
+HEAD_REVISION = "0004"
 
 
 @dataclass(frozen=True, slots=True)

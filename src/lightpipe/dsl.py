@@ -9,7 +9,42 @@ from dataclasses import dataclass, field
 from functools import update_wrapper
 from typing import Any, cast, overload
 
-from lightpipe.models import CachePolicy, RetryPolicy
+from lightpipe.models import CachePolicy, PipelinePolicy, RetryPolicy
+
+
+def _policy_dict(policy: PipelinePolicy) -> dict[str, Any]:
+    retention = policy.retention
+    rate = policy.rate_limit
+    return {
+        "priority": policy.priority,
+        "max_priority": policy.max_priority,
+        "max_concurrency": policy.max_concurrency,
+        "max_active_runs": policy.max_active_runs,
+        "max_fanout": policy.max_fanout,
+        "max_materialized_tasks": policy.max_materialized_tasks,
+        "rate_limit": None
+        if rate is None
+        else {
+            "starts": rate.starts,
+            "per_seconds": rate.per.total_seconds(),
+            "burst": rate.burst,
+        },
+        "retention": {
+            "cache_seconds": None
+            if retention.cache_for is None
+            else retention.cache_for.total_seconds(),
+            "runs_seconds": None
+            if retention.runs_for is None
+            else retention.runs_for.total_seconds(),
+            "events_seconds": None
+            if retention.events_for is None
+            else retention.events_for.total_seconds(),
+            "logs_seconds": None
+            if retention.logs_for is None
+            else retention.logs_for.total_seconds(),
+            "artifact_grace_seconds": retention.artifact_grace.total_seconds(),
+        },
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,12 +108,14 @@ class GraphDefinition:
     outputs: Any
     parameters: tuple[str, ...]
     definition_hash: str
+    policy: PipelinePolicy = field(default_factory=PipelinePolicy)
 
     def public_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "definition_hash": self.definition_hash,
             "parameters": list(self.parameters),
+            "policy": _policy_dict(self.policy),
             "nodes": [
                 {
                     "id": node.id,
@@ -249,9 +286,16 @@ def stage(
 
 
 class Pipeline[**P]:
-    def __init__(self, function: Callable[P, Any], *, name: str | None = None) -> None:
+    def __init__(
+        self,
+        function: Callable[P, Any],
+        *,
+        name: str | None = None,
+        policy: PipelinePolicy | None = None,
+    ) -> None:
         self.function = function
         self.name = name or getattr(function, "__name__", type(function).__name__)
+        self.policy = policy or PipelinePolicy()
         self._compiled: GraphDefinition | None = None
         update_wrapper(self, function)
 
@@ -269,6 +313,7 @@ class Pipeline[**P]:
         canonical = {
             "name": self.name,
             "parameters": list(refs),
+            "policy": _policy_dict(self.policy),
             "nodes": [
                 {
                     "id": node.id,
@@ -284,7 +329,9 @@ class Pipeline[**P]:
         }
         canonical["outputs"] = _canonical_binding(outputs)
         digest = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
-        self._compiled = GraphDefinition(self.name, builder.nodes, outputs, tuple(refs), digest)
+        self._compiled = GraphDefinition(
+            self.name, builder.nodes, outputs, tuple(refs), digest, self.policy
+        )
         return self._compiled
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> PipelineInvocation:
@@ -300,17 +347,21 @@ class PipelineInvocation:
 
 
 @overload
-def pipeline[**P](function: Callable[P, Any], /, *, name: str | None = None) -> Pipeline[P]: ...
+def pipeline[**P](
+    function: Callable[P, Any], /, *, name: str | None = None, policy: PipelinePolicy | None = None
+) -> Pipeline[P]: ...
 
 
 @overload
 def pipeline[**P](
-    function: None = None, *, name: str | None = None
+    function: None = None, *, name: str | None = None, policy: PipelinePolicy | None = None
 ) -> Callable[[Callable[P, Any]], Pipeline[P]]: ...
 
 
-def pipeline(function: Any = None, *, name: str | None = None) -> Any:
+def pipeline(
+    function: Any = None, *, name: str | None = None, policy: PipelinePolicy | None = None
+) -> Any:
     def decorate(target: Any) -> Any:
-        return Pipeline(target, name=name)
+        return Pipeline(target, name=name, policy=policy)
 
     return cast(Any, decorate(function) if function is not None else decorate)

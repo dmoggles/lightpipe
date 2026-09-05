@@ -12,8 +12,11 @@ from lightpipe.backends.base import (
     DEFAULT_TRIGGER_LEASE,
     BackendCapabilities,
     OrchestrationBackend,
+    artifact_references,
 )
 from lightpipe.models import (
+    ArtifactObject,
+    ArtifactPin,
     AttemptState,
     CacheEntry,
     Event,
@@ -32,6 +35,7 @@ from lightpipe.models import (
     TriggerOccurrenceRecord,
     TriggerOccurrenceState,
     TriggerRecord,
+    WorkerRecord,
     new_id,
     utcnow,
 )
@@ -56,6 +60,11 @@ class MemoryBackend(OrchestrationBackend):
         self._attempts: dict[str, list[TaskAttemptRecord]] = {}
         self._logs: list[StageLogRecord] = []
         self._log_sequence = 0
+        self._artifacts: dict[str, tuple[ArtifactObject, datetime | None]] = {}
+        self._artifact_pins: dict[str, ArtifactPin] = {}
+        self._maintenance: dict[str, tuple[str, datetime]] = {}
+        self._rate_buckets: dict[str, tuple[float, datetime]] = {}
+        self._workers: dict[str, WorkerRecord] = {}
         self._lock = asyncio.Lock()
         self._changed = asyncio.Condition()
 
@@ -159,6 +168,25 @@ class MemoryBackend(OrchestrationBackend):
             run.output = output
         await self.append_event(run_id, f"run.{state.value}")
 
+    async def admit_run(self, run_id: str, *, max_active_runs: int | None = None) -> bool:
+        async with self._lock:
+            run = self._runs[run_id]
+            if run.state == RunState.RUNNING:
+                return True
+            if run.state != RunState.PENDING:
+                return False
+            active = sum(
+                item.pipeline_name == run.pipeline_name and item.state == RunState.RUNNING
+                for item in self._runs.values()
+            )
+            if max_active_runs is not None and active >= max_active_runs:
+                return False
+            run.state = RunState.RUNNING
+            run.admitted_at = utcnow()
+            run.updated_at = run.admitted_at
+        await self.append_event(run_id, "run.running")
+        return True
+
     async def add_task(self, task: TaskRecord) -> tuple[TaskRecord, bool]:
         key = (task.run_id, task.node_id, task.map_index)
         async with self._lock:
@@ -180,19 +208,56 @@ class MemoryBackend(OrchestrationBackend):
             return replace(self._tasks[task_id])
 
     async def claim_tasks(
-        self, worker_id: str, *, limit: int = 1, lease_for: timedelta = DEFAULT_TASK_LEASE
+        self,
+        worker_id: str,
+        *,
+        limit: int = 1,
+        lease_for: timedelta = DEFAULT_TASK_LEASE,
+        global_concurrency: int | None = None,
     ) -> list[TaskLease]:
         now = utcnow()
         leases: list[TaskLease] = []
         async with self._lock:
+            active = sum(
+                task.state in {TaskState.LEASED, TaskState.RUNNING} for task in self._tasks.values()
+            )
+            available = limit if global_concurrency is None else max(0, global_concurrency - active)
             candidates = sorted(
-                self._tasks.values(), key=lambda item: (item.available_at, item.created_at)
+                self._tasks.values(),
+                key=lambda item: (
+                    -self._runs[item.run_id].priority,
+                    item.available_at,
+                    item.created_at,
+                ),
             )
             for task in candidates:
-                if len(leases) >= limit:
+                if len(leases) >= min(limit, available):
                     break
                 if task.state != TaskState.RUNNABLE or task.available_at > now:
                     continue
+                run = self._runs[task.run_id]
+                maximum = run.policy.get("max_concurrency")
+                if maximum is not None:
+                    pipeline_active = sum(
+                        candidate.state in {TaskState.LEASED, TaskState.RUNNING}
+                        and self._runs[candidate.run_id].pipeline_name == run.pipeline_name
+                        for candidate in self._tasks.values()
+                    )
+                    if pipeline_active >= int(maximum):
+                        continue
+                rate = run.policy.get("rate_limit")
+                if isinstance(rate, dict):
+                    starts = int(rate["starts"])
+                    period = float(rate["per_seconds"])
+                    burst = int(rate.get("burst") or starts)
+                    tokens, updated = self._rate_buckets.get(run.pipeline_name, (float(burst), now))
+                    tokens = min(
+                        float(burst), tokens + (now - updated).total_seconds() * starts / period
+                    )
+                    if tokens < 1:
+                        self._rate_buckets[run.pipeline_name] = (tokens, now)
+                        continue
+                    self._rate_buckets[run.pipeline_name] = (tokens - 1, now)
                 token = new_id("lease")
                 expires = now + lease_for
                 task.state = TaskState.LEASED
@@ -489,11 +554,189 @@ class MemoryBackend(OrchestrationBackend):
             if entry.expires_at <= utcnow():
                 del self._cache[key]
                 return None
-            return entry
+            touched = replace(entry, last_used_at=utcnow())
+            self._cache[key] = touched
+            return touched
 
     async def put_cache(self, entry: CacheEntry) -> None:
         async with self._lock:
             self._cache[entry.key] = entry
+
+    def _referenced_artifact_uris(self, now: datetime) -> set[str]:
+        values: list[Any] = []
+        for run in self._runs.values():
+            values.extend((run.parameters, run.output))
+        values.extend(task.output for task in self._tasks.values())
+        values.extend(entry.output for entry in self._cache.values() if entry.expires_at > now)
+        values.extend(event.payload for event in self._events)
+        values.extend(log.fields for log in self._logs)
+        values.extend(item.requests for item in self._trigger_occurrences)
+        uris = {uri for value in values for uri in artifact_references(value)}
+        uris.update(
+            pin.uri
+            for pin in self._artifact_pins.values()
+            if pin.expires_at is None or pin.expires_at > now
+        )
+        return uris
+
+    async def catalog_artifact(self, artifact: ArtifactObject) -> None:
+        async with self._lock:
+            current = self._artifacts.get(artifact.uri)
+            self._artifacts[artifact.uri] = (artifact, None if current is None else current[1])
+
+    async def artifact_gc_candidates(
+        self, *, now: datetime, grace: timedelta, limit: int = 100
+    ) -> list[ArtifactObject]:
+        async with self._lock:
+            referenced = self._referenced_artifact_uris(now)
+            candidates: list[ArtifactObject] = []
+            for uri, (artifact, marked) in list(self._artifacts.items()):
+                if uri in referenced:
+                    self._artifacts[uri] = (artifact, None)
+                elif marked is None:
+                    self._artifacts[uri] = (artifact, now)
+                elif marked + grace <= now and artifact.modified_at + grace <= now:
+                    candidates.append(artifact)
+                    if len(candidates) >= limit:
+                        break
+            return candidates
+
+    async def forget_artifact(self, uri: str) -> None:
+        async with self._lock:
+            self._artifacts.pop(uri, None)
+
+    async def pin_artifact(self, pin: ArtifactPin) -> ArtifactPin:
+        async with self._lock:
+            self._artifact_pins[pin.id] = pin
+        return pin
+
+    async def artifact_pins(self) -> list[ArtifactPin]:
+        async with self._lock:
+            return list(self._artifact_pins.values())
+
+    async def unpin_artifact(self, pin_id: str) -> None:
+        async with self._lock:
+            if pin_id not in self._artifact_pins:
+                raise KeyError(pin_id)
+            del self._artifact_pins[pin_id]
+
+    async def prune(self, *, now: datetime, limit: int = 100) -> dict[str, int]:
+        removed = {"cache": 0, "events": 0, "logs": 0, "runs": 0, "pins": 0}
+        async with self._lock:
+            for key, entry in list(self._cache.items()):
+                policy = next(
+                    (
+                        run.policy.get("retention", {})
+                        for run in sorted(
+                            self._runs.values(), key=lambda item: item.created_at, reverse=True
+                        )
+                        if run.pipeline_name == entry.pipeline_name
+                    ),
+                    {},
+                )
+                age = policy.get("cache_seconds")
+                if entry.expires_at <= now or (
+                    age is not None and entry.last_used_at + timedelta(seconds=float(age)) <= now
+                ):
+                    del self._cache[key]
+                    removed["cache"] += 1
+                    if sum(removed.values()) >= limit:
+                        return removed
+            terminal = {
+                run.id: run
+                for run in self._runs.values()
+                if run.state in {RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELLED}
+            }
+            old_events = self._events
+            self._events = [
+                event
+                for event in old_events
+                if not _retention_due(terminal.get(event.run_id), "events_seconds", now)
+            ]
+            removed["events"] = len(old_events) - len(self._events)
+            old_logs = self._logs
+            self._logs = [
+                log
+                for log in old_logs
+                if not _retention_due(terminal.get(log.run_id), "logs_seconds", now)
+            ]
+            removed["logs"] = len(old_logs) - len(self._logs)
+            for run_id, run in list(terminal.items()):
+                if not _retention_due(run, "runs_seconds", now):
+                    continue
+                task_ids = {task.id for task in self._tasks.values() if task.run_id == run_id}
+                self._tasks = {
+                    key: task for key, task in self._tasks.items() if task.run_id != run_id
+                }
+                self._task_keys = {
+                    key: value for key, value in self._task_keys.items() if value not in task_ids
+                }
+                self._attempts = {
+                    key: value for key, value in self._attempts.items() if key not in task_ids
+                }
+                self._expanded = {
+                    key: value for key, value in self._expanded.items() if key[0] != run_id
+                }
+                del self._runs[run_id]
+                removed["runs"] += 1
+            for pin_id, pin in list(self._artifact_pins.items()):
+                if pin.expires_at is not None and pin.expires_at <= now:
+                    del self._artifact_pins[pin_id]
+                    removed["pins"] += 1
+        return removed
+
+    async def claim_maintenance(
+        self, name: str, owner: str, *, lease_for: timedelta
+    ) -> TriggerLease | None:
+        now = utcnow()
+        async with self._lock:
+            current = self._maintenance.get(name)
+            if current is not None and current[1] > now:
+                return None
+            token = new_id("maintenance")
+            expires = now + lease_for
+            self._maintenance[name] = (token, expires)
+            return TriggerLease(name, token, None, expires)
+
+    async def complete_maintenance(self, name: str, token: str) -> None:
+        async with self._lock:
+            current = self._maintenance.get(name)
+            if current is None or current[0] != token:
+                raise StaleLeaseError(f"stale maintenance lease for {name}")
+            del self._maintenance[name]
+
+    async def heartbeat_worker(
+        self, worker_id: str, *, state: str, current_task_id: str | None = None
+    ) -> None:
+        async with self._lock:
+            self._workers[worker_id] = WorkerRecord(worker_id, state, current_task_id, utcnow())
+
+    async def stale_workers(self, *, before: datetime) -> list[WorkerRecord]:
+        async with self._lock:
+            return [item for item in self._workers.values() if item.last_seen_at < before]
+
+    async def force_release_worker(self, worker_id: str) -> int:
+        released: list[tuple[str, str]] = []
+        async with self._lock:
+            for task in self._tasks.values():
+                if task.lease_owner != worker_id or task.state not in {
+                    TaskState.LEASED,
+                    TaskState.RUNNING,
+                }:
+                    continue
+                task.state = TaskState.RUNNABLE
+                task.available_at = utcnow()
+                task.lease_owner = task.lease_token = None
+                task.lease_expires_at = None
+                task.updated_at = utcnow()
+                attempts = self._attempts.get(task.id, [])
+                if attempts and attempts[-1].finished_at is None:
+                    attempts[-1].state = AttemptState.RELEASED
+                    attempts[-1].finished_at = utcnow()
+                released.append((task.run_id, task.id))
+        for run_id, task_id in released:
+            await self.append_event(run_id, "task.force_released", task_id=task_id)
+        return len(released)
 
     async def append_event(
         self,
@@ -736,3 +979,10 @@ def _json_copy(value: Any) -> Any:
     import copy
 
     return copy.deepcopy(value)
+
+
+def _retention_due(run: RunRecord | None, key: str, now: datetime) -> bool:
+    if run is None:
+        return False
+    seconds = run.policy.get("retention", {}).get(key)
+    return seconds is not None and run.updated_at + timedelta(seconds=float(seconds)) <= now

@@ -11,9 +11,12 @@ from lightpipe.backends.base import (
     DEFAULT_TRIGGER_LEASE,
     BackendCapabilities,
     OrchestrationBackend,
+    artifact_references,
 )
 from lightpipe.migration import HEAD_REVISION
 from lightpipe.models import (
+    ArtifactObject,
+    ArtifactPin,
     AttemptState,
     CacheEntry,
     Event,
@@ -33,6 +36,7 @@ from lightpipe.models import (
     TriggerOccurrenceRecord,
     TriggerOccurrenceState,
     TriggerRecord,
+    WorkerRecord,
     new_id,
     utcnow,
 )
@@ -102,8 +106,30 @@ class PostgresBackend(OrchestrationBackend):
             "VALUES (%s, %s, %s, %s, %s::jsonb, %s)",
             (event.id, run_id, task_id, kind, json.dumps(event.payload), event.occurred_at),
         )
+        await self._replace_artifact_references(connection, "event", event.id, event.payload)
         await connection.execute("SELECT pg_notify('lightpipe_events', %s)", (run_id,))
         return event
+
+    async def _replace_artifact_references(
+        self, connection: Any, source_kind: str, source_id: str, value: Any
+    ) -> None:
+        await connection.execute(
+            "DELETE FROM lp_artifact_references WHERE source_kind=%s AND source_id=%s",
+            (source_kind, source_id),
+        )
+        for uri, (digest, size) in artifact_references(value).items():
+            await connection.execute(
+                "INSERT INTO lp_artifacts (uri,digest,size,discovered_at,candidate_since) "
+                "VALUES (%s,%s,%s,clock_timestamp(),NULL) ON CONFLICT (uri) DO UPDATE SET "
+                "digest=COALESCE(EXCLUDED.digest,lp_artifacts.digest),"
+                "size=COALESCE(EXCLUDED.size,lp_artifacts.size),candidate_since=NULL",
+                (uri, digest, size),
+            )
+            await connection.execute(
+                "INSERT INTO lp_artifact_references (uri,source_kind,source_id) "
+                "VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                (uri, source_kind, source_id),
+            )
 
     @staticmethod
     def _run(row: dict[str, Any]) -> RunRecord:
@@ -121,6 +147,9 @@ class PostgresBackend(OrchestrationBackend):
             trace_context=row.get("trace_context"),
             trigger_name=row.get("trigger_name"),
             trigger_occurrence_id=row.get("trigger_occurrence_id"),
+            priority=row.get("priority", 0),
+            policy=row.get("policy") or {},
+            admitted_at=row.get("admitted_at"),
         )
 
     @staticmethod
@@ -220,8 +249,9 @@ class PostgresBackend(OrchestrationBackend):
             cursor = await connection.execute(
                 "INSERT INTO lp_runs (id,pipeline_name,definition_hash,parameters,state,output,"
                 "idempotency_key,created_at,updated_at,rerun_of,trace_context,trigger_name,"
-                "trigger_occurrence_id) "
-                "VALUES (%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb,%s,%s) "
+                "trigger_occurrence_id,priority,policy,admitted_at) "
+                "VALUES (%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,"
+                "%s::jsonb,%s) "
                 f"{conflict}RETURNING *",
                 (
                     run.id,
@@ -237,10 +267,16 @@ class PostgresBackend(OrchestrationBackend):
                     json.dumps(run.trace_context),
                     run.trigger_name,
                     run.trigger_occurrence_id,
+                    run.priority,
+                    json.dumps(run.policy),
+                    run.admitted_at,
                 ),
             )
             row = await cursor.fetchone()
             if row is not None:
+                await self._replace_artifact_references(
+                    connection, "run_parameters", run.id, run.parameters
+                )
                 await self._event(connection, run.id, "run.created")
                 return self._run(row)
             cursor = await connection.execute(
@@ -376,6 +412,7 @@ class PostgresBackend(OrchestrationBackend):
                 ),
             )
             if cursor.rowcount:
+                await self._replace_artifact_references(connection, "run_output", run_id, output)
                 await self._event(connection, run_id, f"run.{state.value}")
                 return
             cursor = await connection.execute("SELECT state FROM lp_runs WHERE id=%s", (run_id,))
@@ -390,6 +427,38 @@ class PostgresBackend(OrchestrationBackend):
                 raise InvalidTransitionError(
                     f"run {run_id} is already terminal in state {row['state']}"
                 )
+
+    async def admit_run(self, run_id: str, *, max_active_runs: int | None = None) -> bool:
+        async with self._pool.connection() as connection, connection.transaction():
+            cursor = await connection.execute(
+                "SELECT pipeline_name,state FROM lp_runs WHERE id=%s FOR UPDATE", (run_id,)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            if row["state"] == RunState.RUNNING.value:
+                return True
+            if row["state"] != RunState.PENDING.value:
+                return False
+            # Serialize admissions for a pipeline without introducing a policy singleton table.
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))", (f"lightpipe:{row['pipeline_name']}",)
+            )
+            if max_active_runs is not None:
+                result = await connection.execute(
+                    "SELECT count(*) AS count FROM lp_runs "
+                    "WHERE pipeline_name=%s AND state='running'",
+                    (row["pipeline_name"],),
+                )
+                if (await result.fetchone())["count"] >= max_active_runs:
+                    return False
+            await connection.execute(
+                "UPDATE lp_runs SET state='running',admitted_at=clock_timestamp(),"
+                "updated_at=clock_timestamp() WHERE id=%s",
+                (run_id,),
+            )
+            await self._event(connection, run_id, "run.running")
+            return True
 
     async def add_task(self, task: TaskRecord) -> tuple[TaskRecord, bool]:
         async with self._pool.connection() as connection, connection.transaction():
@@ -436,21 +505,59 @@ class PostgresBackend(OrchestrationBackend):
             return self._task(row)
 
     async def claim_tasks(
-        self, worker_id: str, *, limit: int = 1, lease_for: timedelta = DEFAULT_TASK_LEASE
+        self,
+        worker_id: str,
+        *,
+        limit: int = 1,
+        lease_for: timedelta = DEFAULT_TASK_LEASE,
+        global_concurrency: int | None = None,
     ) -> list[TaskLease]:
         async with self._pool.connection() as connection, connection.transaction():
+            # Capacity and token decisions must observe claims committed by every replica.
+            await connection.execute("SELECT pg_advisory_xact_lock(hashtext('lightpipe:claims'))")
+            if global_concurrency is not None:
+                active_cursor = await connection.execute(
+                    "SELECT count(*) AS count FROM lp_tasks WHERE state IN ('leased','running')"
+                )
+                active = (await active_cursor.fetchone())["count"]
+                limit = min(limit, max(0, global_concurrency - active))
+            if limit == 0:
+                return []
             cursor = await connection.execute(
-                "WITH candidates AS (SELECT id FROM lp_tasks WHERE state='runnable' "
-                "AND available_at<=clock_timestamp() ORDER BY available_at,created_at "
-                "FOR UPDATE SKIP LOCKED LIMIT %s) "
-                "UPDATE lp_tasks t SET state='leased',attempt=t.attempt+1,lease_owner=%s,"
-                "lease_token='lease_' || md5(random()::text || clock_timestamp()::text),"
-                "lease_expires_at=clock_timestamp()+(%s * interval '1 second'),"
-                "updated_at=clock_timestamp() FROM candidates c WHERE t.id=c.id RETURNING t.*",
-                (limit, worker_id, lease_for.total_seconds()),
+                "SELECT t.*,r.pipeline_name,r.policy,r.priority FROM lp_tasks t "
+                "JOIN lp_runs r ON r.id=t.run_id WHERE t.state='runnable' "
+                "AND t.available_at<=clock_timestamp() "
+                "ORDER BY r.priority DESC,t.available_at,t.created_at "
+                "FOR UPDATE OF t SKIP LOCKED LIMIT %s",
+                (max(limit * 20, 100),),
             )
-            rows = await cursor.fetchall()
-            for row in rows:
+            candidates = await cursor.fetchall()
+            rows: list[dict[str, Any]] = []
+            for candidate in candidates:
+                policy = candidate["policy"] or {}
+                maximum = policy.get("max_concurrency")
+                if maximum is not None:
+                    active_cursor = await connection.execute(
+                        "SELECT count(*) AS count FROM lp_tasks t JOIN lp_runs r ON r.id=t.run_id "
+                        "WHERE r.pipeline_name=%s AND t.state IN ('leased','running')",
+                        (candidate["pipeline_name"],),
+                    )
+                    if (await active_cursor.fetchone())["count"] >= int(maximum):
+                        continue
+                rate = policy.get("rate_limit")
+                if isinstance(rate, dict) and not await self._consume_rate(
+                    connection, candidate["pipeline_name"], rate
+                ):
+                    continue
+                updated = await connection.execute(
+                    "UPDATE lp_tasks SET state='leased',attempt=attempt+1,lease_owner=%s,"
+                    "lease_token='lease_' || md5(random()::text || clock_timestamp()::text),"
+                    "lease_expires_at=clock_timestamp()+(%s * interval '1 second'),"
+                    "updated_at=clock_timestamp() WHERE id=%s RETURNING *",
+                    (worker_id, lease_for.total_seconds(), candidate["id"]),
+                )
+                row = await updated.fetchone()
+                rows.append(row)
                 await connection.execute(
                     "INSERT INTO lp_task_attempts "
                     "(id,task_id,run_id,attempt,worker_id,state,leased_at) "
@@ -464,9 +571,39 @@ class PostgresBackend(OrchestrationBackend):
                     ),
                 )
                 await self._event(connection, row["run_id"], "task.leased", task_id=row["id"])
+                if len(rows) >= limit:
+                    break
         return [
             TaskLease(self._task(row), row["lease_token"], row["lease_expires_at"]) for row in rows
         ]
+
+    async def _consume_rate(
+        self, connection: Any, pipeline_name: str, rate: dict[str, Any]
+    ) -> bool:
+        starts = int(rate["starts"])
+        period = float(rate["per_seconds"])
+        burst = int(rate.get("burst") or starts)
+        cursor = await connection.execute(
+            "SELECT tokens,updated_at FROM lp_rate_limits WHERE pipeline_name=%s FOR UPDATE",
+            (pipeline_name,),
+        )
+        row = await cursor.fetchone()
+        now = utcnow()
+        tokens = float(burst)
+        if row is not None:
+            tokens = min(
+                float(burst),
+                float(row["tokens"]) + (now - row["updated_at"]).total_seconds() * starts / period,
+            )
+        allowed = tokens >= 1
+        tokens = tokens - 1 if allowed else tokens
+        await connection.execute(
+            "INSERT INTO lp_rate_limits (pipeline_name,tokens,updated_at) VALUES (%s,%s,%s) "
+            "ON CONFLICT (pipeline_name) DO UPDATE SET tokens=EXCLUDED.tokens,"
+            "updated_at=EXCLUDED.updated_at",
+            (pipeline_name, tokens, now),
+        )
+        return allowed
 
     async def _transition_leased(
         self,
@@ -477,6 +614,7 @@ class PostgresBackend(OrchestrationBackend):
         kind: str,
         *,
         payload: dict[str, Any] | None = None,
+        reference_value: Any = None,
     ) -> dict[str, Any]:
         async with self._pool.connection() as connection, connection.transaction():
             cursor = await connection.execute(
@@ -519,6 +657,10 @@ class PostgresBackend(OrchestrationBackend):
                         row["attempt"],
                     ),
                 )
+            if reference_value is not None:
+                await self._replace_artifact_references(
+                    connection, "task_output", task_id, reference_value
+                )
             await self._event(connection, row["run_id"], kind, task_id=task_id, payload=payload)
             return row
 
@@ -556,6 +698,7 @@ class PostgresBackend(OrchestrationBackend):
             "lease_expires_at=NULL",
             (state, json.dumps(output)),
             f"task.{state}",
+            reference_value=output,
         )
 
     async def fail_task(
@@ -721,6 +864,7 @@ class PostgresBackend(OrchestrationBackend):
                 ),
             )
             row = await cursor.fetchone()
+            await self._replace_artifact_references(connection, "log", log_id, fields or {})
             await connection.execute("SELECT pg_notify('lightpipe_logs', %s)", (task_id,))
             return self._log(row)
 
@@ -799,20 +943,265 @@ class PostgresBackend(OrchestrationBackend):
             )
             cursor = await connection.execute("SELECT * FROM lp_cache WHERE key=%s", (key,))
             row = await cursor.fetchone()
+            if row is not None:
+                await connection.execute(
+                    "UPDATE lp_cache SET last_used_at=clock_timestamp() WHERE key=%s", (key,)
+                )
             return (
                 None
                 if row is None
-                else CacheEntry(row["key"], row["output"], row["expires_at"], row["created_at"])
+                else CacheEntry(
+                    row["key"],
+                    row["output"],
+                    row["expires_at"],
+                    row["created_at"],
+                    row["pipeline_name"],
+                    utcnow(),
+                )
             )
 
     async def put_cache(self, entry: CacheEntry) -> None:
+        async with self._pool.connection() as connection, connection.transaction():
+            await connection.execute(
+                "INSERT INTO lp_cache "
+                "(key,output,created_at,expires_at,pipeline_name,last_used_at) "
+                "VALUES (%s,%s::jsonb,%s,%s,%s,%s) ON CONFLICT (key) DO UPDATE SET "
+                "output=EXCLUDED.output,created_at=EXCLUDED.created_at,"
+                "expires_at=EXCLUDED.expires_at,pipeline_name=EXCLUDED.pipeline_name,"
+                "last_used_at=EXCLUDED.last_used_at",
+                (
+                    entry.key,
+                    json.dumps(entry.output),
+                    entry.created_at,
+                    entry.expires_at,
+                    entry.pipeline_name,
+                    entry.last_used_at,
+                ),
+            )
+            await self._replace_artifact_references(connection, "cache", entry.key, entry.output)
+
+    async def catalog_artifact(self, artifact: ArtifactObject) -> None:
         async with self._pool.connection() as connection:
             await connection.execute(
-                "INSERT INTO lp_cache VALUES (%s,%s::jsonb,%s,%s) ON CONFLICT (key) DO UPDATE SET "
-                "output=EXCLUDED.output,created_at=EXCLUDED.created_at,"
-                "expires_at=EXCLUDED.expires_at",
-                (entry.key, json.dumps(entry.output), entry.created_at, entry.expires_at),
+                "INSERT INTO lp_artifacts (uri,digest,size,discovered_at) VALUES (%s,%s,%s,%s) "
+                "ON CONFLICT (uri) DO UPDATE SET "
+                "digest=COALESCE(EXCLUDED.digest,lp_artifacts.digest),"
+                "size=COALESCE(EXCLUDED.size,lp_artifacts.size)",
+                (artifact.uri, artifact.digest, artifact.size, artifact.modified_at),
             )
+
+    async def artifact_gc_candidates(
+        self, *, now: datetime, grace: timedelta, limit: int = 100
+    ) -> list[ArtifactObject]:
+        # JSON-path scans intentionally cover old rows created before reference indexing existed.
+        live_sql = """
+        SELECT value #>> '{}' AS uri FROM lp_runs r,
+          LATERAL jsonb_path_query(r.parameters, '$.**."$artifact"') value
+        UNION SELECT value #>> '{}' FROM lp_runs r,
+          LATERAL jsonb_path_query(r.output, '$.**."$artifact"') value
+        UNION SELECT value #>> '{}' FROM lp_tasks t,
+          LATERAL jsonb_path_query(t.output, '$.**."$artifact"') value
+        UNION SELECT value #>> '{}' FROM lp_cache c,
+          LATERAL jsonb_path_query(c.output, '$.**."$artifact"') value
+          WHERE c.expires_at > clock_timestamp()
+        UNION SELECT value #>> '{}' FROM lp_events e,
+          LATERAL jsonb_path_query(e.payload, '$.**."$artifact"') value
+        UNION SELECT value #>> '{}' FROM lp_stage_logs l,
+          LATERAL jsonb_path_query(l.fields, '$.**."$artifact"') value
+        UNION SELECT value #>> '{}' FROM lp_trigger_occurrences o,
+          LATERAL jsonb_path_query(o.requests, '$.**."$artifact"') value
+        UNION SELECT uri FROM lp_artifact_pins
+          WHERE expires_at IS NULL OR expires_at > clock_timestamp()
+        UNION SELECT uri FROM lp_artifact_references
+        """
+        async with self._pool.connection() as connection, connection.transaction():
+            active = await connection.execute(
+                "SELECT 1 FROM lp_tasks WHERE state IN ('leased','running') LIMIT 1"
+            )
+            if await active.fetchone() is None:
+                await connection.execute(
+                    f"UPDATE lp_artifacts SET candidate_since=COALESCE(candidate_since,%s) "
+                    f"WHERE uri NOT IN ({live_sql})",
+                    (now,),
+                )
+            await connection.execute(
+                f"UPDATE lp_artifacts SET candidate_since=NULL WHERE uri IN ({live_sql})"
+            )
+            cursor = await connection.execute(
+                f"SELECT uri,digest,size,discovered_at FROM lp_artifacts "
+                f"WHERE candidate_since<=%s AND discovered_at<=%s "
+                f"AND uri NOT IN ({live_sql}) ORDER BY candidate_since LIMIT %s",
+                (now - grace, now - grace, limit),
+            )
+            return [
+                ArtifactObject(row["uri"], row["discovered_at"], row["digest"], row["size"])
+                for row in await cursor.fetchall()
+            ]
+
+    async def forget_artifact(self, uri: str) -> None:
+        async with self._pool.connection() as connection:
+            await connection.execute("DELETE FROM lp_artifacts WHERE uri=%s", (uri,))
+
+    async def pin_artifact(self, pin: ArtifactPin) -> ArtifactPin:
+        async with self._pool.connection() as connection:
+            await connection.execute(
+                "INSERT INTO lp_artifact_pins (id,uri,label,created_at,expires_at) "
+                "VALUES (%s,%s,%s,%s,%s)",
+                (pin.id, pin.uri, pin.label, pin.created_at, pin.expires_at),
+            )
+        return pin
+
+    async def artifact_pins(self) -> list[ArtifactPin]:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                "SELECT * FROM lp_artifact_pins ORDER BY created_at,id"
+            )
+            return [
+                ArtifactPin(
+                    row["id"], row["uri"], row["label"], row["created_at"], row["expires_at"]
+                )
+                for row in await cursor.fetchall()
+            ]
+
+    async def unpin_artifact(self, pin_id: str) -> None:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute("DELETE FROM lp_artifact_pins WHERE id=%s", (pin_id,))
+            if not cursor.rowcount:
+                raise KeyError(pin_id)
+
+    async def prune(self, *, now: datetime, limit: int = 100) -> dict[str, int]:
+        removed = {"cache": 0, "events": 0, "logs": 0, "runs": 0, "pins": 0}
+        async with self._pool.connection() as connection, connection.transaction():
+            cursor = await connection.execute(
+                "DELETE FROM lp_cache WHERE key IN (SELECT key FROM lp_cache WHERE "
+                "expires_at<=%s OR (pipeline_name IS NOT NULL AND EXISTS (SELECT 1 FROM lp_runs r "
+                "WHERE r.pipeline_name=lp_cache.pipeline_name "
+                "AND r.policy->'retention'->>'cache_seconds' IS NOT NULL "
+                "AND lp_cache.last_used_at + "
+                "((r.policy->'retention'->>'cache_seconds')::double precision "
+                "* interval '1 second') <= %s)) LIMIT %s)",
+                (now, now, limit),
+            )
+            removed["cache"] = cursor.rowcount
+            remaining = max(0, limit - sum(removed.values()))
+            for table, key, result_key in (
+                ("lp_events", "events_seconds", "events"),
+                ("lp_stage_logs", "logs_seconds", "logs"),
+            ):
+                if remaining == 0:
+                    break
+                cursor = await connection.execute(
+                    f"DELETE FROM {table} item WHERE item.ctid IN "
+                    f"(SELECT item.ctid FROM {table} item "
+                    "JOIN lp_runs r ON r.id=item.run_id WHERE r.state IN "
+                    "('succeeded','failed','cancelled') AND "
+                    f"r.policy->'retention'->>'{key}' IS NOT NULL AND r.updated_at + "
+                    f"((r.policy->'retention'->>'{key}')::double precision * interval '1 second') "
+                    "<= %s LIMIT %s)",
+                    (now, remaining),
+                )
+                removed[result_key] = cursor.rowcount
+                remaining = max(0, limit - sum(removed.values()))
+            if remaining:
+                cursor = await connection.execute(
+                    "DELETE FROM lp_runs r WHERE r.id IN (SELECT id FROM lp_runs WHERE state IN "
+                    "('succeeded','failed','cancelled') AND "
+                    "policy->'retention'->>'runs_seconds' IS NOT NULL AND updated_at + "
+                    "((policy->'retention'->>'runs_seconds')::double precision "
+                    "* interval '1 second') "
+                    "<= %s LIMIT %s)",
+                    (now, remaining),
+                )
+                removed["runs"] = cursor.rowcount
+            cursor = await connection.execute(
+                "DELETE FROM lp_artifact_pins WHERE expires_at IS NOT NULL AND expires_at<=%s",
+                (now,),
+            )
+            removed["pins"] = cursor.rowcount
+            await connection.execute(
+                "DELETE FROM lp_artifact_references ref WHERE "
+                "(source_kind IN ('run_parameters','run_output') "
+                "AND NOT EXISTS (SELECT 1 FROM lp_runs WHERE id=ref.source_id)) OR "
+                "(source_kind='task_output' "
+                "AND NOT EXISTS (SELECT 1 FROM lp_tasks WHERE id=ref.source_id)) OR "
+                "(source_kind='event' "
+                "AND NOT EXISTS (SELECT 1 FROM lp_events WHERE id=ref.source_id)) OR "
+                "(source_kind='log' "
+                "AND NOT EXISTS (SELECT 1 FROM lp_stage_logs WHERE id=ref.source_id)) OR "
+                "(source_kind='cache' "
+                "AND NOT EXISTS (SELECT 1 FROM lp_cache WHERE key=ref.source_id)) OR "
+                "(source_kind='trigger_occurrence' AND NOT EXISTS "
+                "(SELECT 1 FROM lp_trigger_occurrences WHERE id=ref.source_id))"
+            )
+        return removed
+
+    async def claim_maintenance(
+        self, name: str, owner: str, *, lease_for: timedelta
+    ) -> TriggerLease | None:
+        token = new_id("maintenance")
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                "INSERT INTO lp_maintenance_leases (name,owner,token,expires_at) VALUES "
+                "(%s,%s,%s,clock_timestamp()+(%s * interval '1 second')) ON CONFLICT (name) "
+                "DO UPDATE SET owner=EXCLUDED.owner,token=EXCLUDED.token,"
+                "expires_at=EXCLUDED.expires_at "
+                "WHERE lp_maintenance_leases.expires_at<=clock_timestamp() RETURNING expires_at",
+                (name, owner, token, lease_for.total_seconds()),
+            )
+            row = await cursor.fetchone()
+            return None if row is None else TriggerLease(name, token, None, row["expires_at"])
+
+    async def complete_maintenance(self, name: str, token: str) -> None:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                "DELETE FROM lp_maintenance_leases WHERE name=%s AND token=%s",
+                (name, token),
+            )
+            if not cursor.rowcount:
+                raise StaleLeaseError(f"stale maintenance lease for {name}")
+
+    async def heartbeat_worker(
+        self, worker_id: str, *, state: str, current_task_id: str | None = None
+    ) -> None:
+        async with self._pool.connection() as connection:
+            await connection.execute(
+                "INSERT INTO lp_workers (id,state,current_task_id,last_seen_at) "
+                "VALUES (%s,%s,%s,clock_timestamp()) ON CONFLICT (id) DO UPDATE SET "
+                "state=EXCLUDED.state,current_task_id=EXCLUDED.current_task_id,"
+                "last_seen_at=EXCLUDED.last_seen_at",
+                (worker_id, state, current_task_id),
+            )
+
+    async def stale_workers(self, *, before: datetime) -> list[WorkerRecord]:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                "SELECT * FROM lp_workers WHERE last_seen_at<%s ORDER BY last_seen_at", (before,)
+            )
+            return [
+                WorkerRecord(row["id"], row["state"], row["current_task_id"], row["last_seen_at"])
+                for row in await cursor.fetchall()
+            ]
+
+    async def force_release_worker(self, worker_id: str) -> int:
+        async with self._pool.connection() as connection, connection.transaction():
+            cursor = await connection.execute(
+                "UPDATE lp_tasks SET state='runnable',available_at=clock_timestamp(),"
+                "lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,"
+                "updated_at=clock_timestamp() WHERE lease_owner=%s "
+                "AND state IN ('leased','running') RETURNING id,run_id,attempt",
+                (worker_id,),
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                await connection.execute(
+                    "UPDATE lp_task_attempts SET state='released',finished_at=clock_timestamp() "
+                    "WHERE task_id=%s AND attempt=%s AND finished_at IS NULL",
+                    (row["id"], row["attempt"]),
+                )
+                await self._event(
+                    connection, row["run_id"], "task.force_released", task_id=row["id"]
+                )
+            return len(rows)
 
     async def append_event(
         self,
@@ -1035,6 +1424,9 @@ class PostgresBackend(OrchestrationBackend):
             )
             row = await cursor.fetchone()
             if row is not None:
+                await self._replace_artifact_references(
+                    connection, "trigger_occurrence", occurrence.id, occurrence.requests
+                )
                 return self._occurrence(row), True
             if occurrence.delivery_id is not None:
                 cursor = await connection.execute(

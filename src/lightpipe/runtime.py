@@ -26,6 +26,7 @@ from lightpipe.execution import capture_structured_logs, execute_in_subprocess
 from lightpipe.models import (
     ArtifactRef,
     CacheEntry,
+    CapacityExceededError,
     PipelineDefinitionRecord,
     RunRecord,
     RunState,
@@ -112,6 +113,7 @@ class Runtime:
         idempotency_key: str | None = None,
         trigger_name: str | None = None,
         trigger_occurrence_id: str | None = None,
+        priority: int | None = None,
     ) -> RunRecord:
         with span("lightpipe.run.submit", pipeline=invocation.graph.name):
             return await self._submit(
@@ -119,6 +121,7 @@ class Runtime:
                 idempotency_key=idempotency_key,
                 trigger_name=trigger_name,
                 trigger_occurrence_id=trigger_occurrence_id,
+                priority=priority,
             )
 
     async def _submit(
@@ -128,6 +131,7 @@ class Runtime:
         idempotency_key: str | None = None,
         trigger_name: str | None = None,
         trigger_occurrence_id: str | None = None,
+        priority: int | None = None,
     ) -> RunRecord:
         graph = invocation.graph
         add_metric("lightpipe.run.submissions", pipeline=graph.name)
@@ -150,12 +154,19 @@ class Runtime:
             ),
             trigger_name=trigger_name,
             trigger_occurrence_id=trigger_occurrence_id,
+            priority=graph.policy.effective_priority(priority),
+            policy=graph.public_dict()["policy"],
         )
         stored = await self.backend.create_run(run)
         if stored.id != run.id:
             return stored
-        await self.backend.set_run_state(run.id, RunState.RUNNING)
-        await self.reconcile(run.id)
+        admitted = await self.backend.admit_run(
+            run.id, max_active_runs=graph.policy.max_active_runs
+        )
+        if admitted:
+            await self.reconcile(run.id)
+        else:
+            add_metric("lightpipe.run.deferred", pipeline=graph.name)
         return await self.backend.get_run(run.id)
 
     async def rerun(self, run_id: str, *, idempotency_key: str | None = None) -> RunRecord:
@@ -172,11 +183,16 @@ class Runtime:
             idempotency_key=idempotency_key,
             rerun_of=original.id,
             trace_context=original.trace_context,
+            priority=original.priority,
+            policy=original.policy,
         )
         stored = await self.backend.create_run(run)
         if stored.id == run.id:
-            await self.backend.set_run_state(run.id, RunState.RUNNING)
-            await self.reconcile(run.id)
+            admitted = await self.backend.admit_run(
+                run.id, max_active_runs=graph.policy.max_active_runs
+            )
+            if admitted:
+                await self.reconcile(run.id)
         return await self.backend.get_run(stored.id)
 
     async def retry_failed(self, run_id: str, *, task_ids: tuple[str, ...] = ()) -> RunRecord:
@@ -290,6 +306,13 @@ class Runtime:
 
     async def _reconcile(self, run_id: str) -> RunRecord:
         run = await self.backend.get_run(run_id)
+        if run.state == RunState.PENDING:
+            graph = self.definition_for(run)
+            if not await self.backend.admit_run(
+                run_id, max_active_runs=graph.policy.max_active_runs
+            ):
+                return run
+            run = await self.backend.get_run(run_id)
         if run.state in {RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELLED}:
             return run
         graph = self.definition_for(run)
@@ -305,7 +328,27 @@ class Runtime:
                     await self.backend.mark_expanded(run_id, node.id, 0)
                     continue
                 items = await self._map_items(node.args[0], run, tasks)
-                for index, _ in items:
+                if graph.policy.max_fanout is not None and len(items) > graph.policy.max_fanout:
+                    error = CapacityExceededError(
+                        f"mapped node {node.id} fan-out {len(items)} exceeds "
+                        f"limit {graph.policy.max_fanout}"
+                    )
+                    await self.backend.append_event(
+                        run_id, "run.capacity_exceeded", payload={"error": str(error)}
+                    )
+                    await self.backend.set_run_state(run_id, RunState.FAILED)
+                    return await self.backend.get_run(run_id)
+                existing_indexes = {task.map_index for task in existing}
+                capacity = graph.policy.max_materialized_tasks
+                if capacity is not None:
+                    active = sum(not task.state.terminal for task in tasks)
+                    remaining = max(0, capacity - active)
+                else:
+                    remaining = len(items)
+                missing = [
+                    (index, value) for index, value in items if index not in existing_indexes
+                ]
+                for index, _ in missing[:remaining]:
                     task = TaskRecord(
                         new_id("task"), run_id, node.id, TaskState.RUNNABLE, map_index=index
                     )
@@ -314,7 +357,8 @@ class Runtime:
                         tasks.append(added)
                 # Mark only after idempotently creating every item. A crash before this point
                 # causes harmless re-expansion rather than permanently losing mapped tasks.
-                await self.backend.mark_expanded(run_id, node.id, len(items))
+                if len(existing) + min(len(missing), remaining) == len(items):
+                    await self.backend.mark_expanded(run_id, node.id, len(items))
             elif not existing and not failed_dependency:
                 task = TaskRecord(new_id("task"), run_id, node.id, TaskState.RUNNABLE)
                 added, created = await self.backend.add_task(task)
@@ -385,7 +429,9 @@ class Runtime:
                 await asyncio.sleep(0.01)
 
     async def reconcile_all(self, *, limit: int = 1000) -> None:
-        for run in await self.backend.list_runs(limit=limit):
+        runs = await self.backend.list_runs(limit=limit)
+        runs.sort(key=lambda run: (-run.priority, run.created_at))
+        for run in runs:
             if (
                 run.state in {RunState.PENDING, RunState.RUNNING}
                 and run.definition_hash in self._definitions
@@ -401,35 +447,56 @@ class Worker:
         *,
         lease_for: timedelta = DEFAULT_TASK_LEASE,
         process_isolation: bool = True,
+        global_concurrency: int | None = None,
+        termination_grace: float = 1.0,
     ) -> None:
         if lease_for.total_seconds() < 0.1:
             raise ValueError("worker lease duration must be at least 0.1 seconds")
+        if global_concurrency is not None and global_concurrency < 1:
+            raise ValueError("global concurrency must be positive")
+        if termination_grace < 0:
+            raise ValueError("termination grace cannot be negative")
         self.runtime = runtime
         self.backend = runtime.backend
         self.worker_id = worker_id
         self.lease_for = lease_for
         self.process_isolation = process_isolation
+        self.global_concurrency = global_concurrency
+        self.termination_grace = termination_grace
         self.current_task_id: str | None = None
         self.completed_tasks = 0
 
     async def run_once(self) -> bool:
-        leases = await self.backend.claim_tasks(self.worker_id, limit=1, lease_for=self.lease_for)
+        await self.backend.heartbeat_worker(self.worker_id, state="idle")
+        leases = await self.backend.claim_tasks(
+            self.worker_id,
+            limit=1,
+            lease_for=self.lease_for,
+            global_concurrency=self.global_concurrency,
+        )
         if not leases:
             # Reconciliation is idempotent. Doing it while idle repairs the boundary where a
             # worker committed a result but died before activating downstream work.
             await self.runtime.reconcile_all()
             leases = await self.backend.claim_tasks(
-                self.worker_id, limit=1, lease_for=self.lease_for
+                self.worker_id,
+                limit=1,
+                lease_for=self.lease_for,
+                global_concurrency=self.global_concurrency,
             )
             if not leases:
                 return False
         lease = leases[0]
         self.current_task_id = lease.task.id
+        await self.backend.heartbeat_worker(
+            self.worker_id, state="busy", current_task_id=self.current_task_id
+        )
         try:
             await self.execute(lease)
             self.completed_tasks += 1
         finally:
             self.current_task_id = None
+            await self.backend.heartbeat_worker(self.worker_id, state="idle")
         return True
 
     async def execute(self, lease: TaskLease) -> None:
@@ -475,6 +542,9 @@ class Worker:
 
                 async def heartbeat() -> None:
                     await self.backend.heartbeat(task.id, lease.token, lease_for=self.lease_for)
+                    await self.backend.heartbeat_worker(
+                        self.worker_id, state="busy", current_task_id=task.id
+                    )
 
                 async def persist_log(message: dict[str, Any]) -> None:
                     trace_id, span_id = current_trace_ids()
@@ -500,6 +570,7 @@ class Worker:
                     heartbeat=heartbeat,
                     log=persist_log,
                     heartbeat_interval=min(1.0, self.lease_for.total_seconds() / 3),
+                    termination_grace=self.termination_grace,
                 )
             else:
                 captured_error: BaseException | None = None
@@ -530,7 +601,12 @@ class Worker:
             add_metric("lightpipe.task.completions", node=node.id, outcome="succeeded")
             if cache_key is not None and node.stage.cache is not None:
                 await self.backend.put_cache(
-                    CacheEntry(cache_key, result, utcnow() + node.stage.cache.ttl)
+                    CacheEntry(
+                        cache_key,
+                        result,
+                        utcnow() + node.stage.cache.ttl,
+                        pipeline_name=(await self.backend.get_run(task.run_id)).pipeline_name,
+                    )
                 )
         except asyncio.CancelledError:
             with suppress(StaleLeaseError):

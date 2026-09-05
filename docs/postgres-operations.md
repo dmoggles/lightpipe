@@ -47,9 +47,8 @@ Worker execution is at least once. A killed worker retains its lease until expir
 returns the task to runnable state. Fencing prevents the former worker from committing after a
 replacement claims the task. External stage writes must therefore be idempotent.
 
-Run, task, attempt, stage-log, event, cache, trigger, and trigger-occurrence rows are currently
-retained indefinitely,
-except that expired
-cache entries are removed on lookup. Until retention jobs arrive in Milestone 5, monitor database
-growth and perform only operator-reviewed archival. Do not delete records belonging to retained
-runs.
+Retention is opt-in through each pipeline's `PipelinePolicy`. The leased maintenance loop removes
+expired cache rows and independently ages terminal runs, events, and stage logs in bounded batches.
+Without an explicit duration those records remain retained indefinitely. Configure a shared
+artifact store on `serve` before enabling physical garbage collection, and use `retention run
+--dry-run` plus `artifact gc --dry-run` when validating a new policy.

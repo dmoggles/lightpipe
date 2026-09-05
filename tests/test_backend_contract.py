@@ -12,6 +12,8 @@ from lightpipe.backends.base import OrchestrationBackend
 from lightpipe.backends.memory import MemoryBackend
 from lightpipe.dsl import pipeline, stage
 from lightpipe.models import (
+    ArtifactObject,
+    ArtifactPin,
     CacheEntry,
     InvalidTransitionError,
     PipelineDefinitionRecord,
@@ -48,7 +50,9 @@ async def backend(request: pytest.FixtureRequest) -> AsyncIterator[Orchestration
     async with value._pool.connection() as connection:
         await connection.execute(
             "TRUNCATE lp_stage_logs,lp_task_attempts,lp_events,lp_expansions,lp_tasks,"
-            "lp_runs,lp_cache,lp_triggers,lp_pipeline_definitions "
+            "lp_runs,lp_cache,lp_triggers,lp_pipeline_definitions,lp_rate_limits,"
+            "lp_artifact_pins,lp_artifact_references,lp_artifacts,lp_workers,"
+            "lp_maintenance_leases "
             "RESTART IDENTITY CASCADE"
         )
     try:
@@ -269,6 +273,34 @@ async def test_backend_contract_expansion_cache_and_trigger(
     resumed = await backend.claim_trigger("trigger", "two")
     assert resumed is not None
     assert resumed.cursor == {"cursor": 2}
+
+
+@pytest.mark.asyncio
+async def test_backend_contract_maintenance_artifacts_and_workers(
+    backend: OrchestrationBackend,
+) -> None:
+    now = utcnow()
+    artifact = ArtifactObject("file:///tmp/contract-artifact", now - timedelta(days=2))
+    await backend.catalog_artifact(artifact)
+    pin = ArtifactPin("pin-contract", artifact.uri, "contract")
+    await backend.pin_artifact(pin)
+    assert await backend.artifact_pins() == [pin]
+    assert await backend.artifact_gc_candidates(now=now, grace=timedelta(0)) == []
+    await backend.unpin_artifact(pin.id)
+    assert await backend.artifact_gc_candidates(now=now, grace=timedelta(0)) == []
+    assert await backend.artifact_gc_candidates(
+        now=now + timedelta(seconds=1), grace=timedelta(0)
+    ) == [artifact]
+    await backend.forget_artifact(artifact.uri)
+
+    lease = await backend.claim_maintenance("contract", "one", lease_for=timedelta(minutes=1))
+    assert lease is not None
+    assert (
+        await backend.claim_maintenance("contract", "two", lease_for=timedelta(minutes=1)) is None
+    )
+    await backend.complete_maintenance("contract", lease.token)
+    await backend.heartbeat_worker("worker-contract", state="idle")
+    assert await backend.stale_workers(before=now + timedelta(minutes=1))
 
 
 @pytest.mark.asyncio

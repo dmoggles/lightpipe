@@ -4,21 +4,40 @@ import argparse
 import asyncio
 import dataclasses
 import importlib
+import inspect
 import json
 import signal
 import sys
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lightpipe.artifacts import load_artifact_store
 from lightpipe.backends.loader import load_backend
 from lightpipe.dsl import Pipeline
-from lightpipe.models import RunRecord, RunState, new_id
+from lightpipe.maintenance import MaintenanceRunner
+from lightpipe.models import (
+    ArtifactPin,
+    RunRecord,
+    RunState,
+    TriggerOccurrenceRecord,
+    TriggerOccurrenceState,
+    new_id,
+    utcnow,
+)
 from lightpipe.observability import configure_observability
 from lightpipe.runtime import Runtime, Worker
 from lightpipe.service import ServiceSupervisor
-from lightpipe.triggers import Poller, Schedule, TriggerDefinition, Webhook
+from lightpipe.triggers import (
+    CronExpression,
+    Poller,
+    Schedule,
+    ScheduledOccurrence,
+    TriggerDefinition,
+    Webhook,
+    trigger_record,
+)
 
 
 def _object(reference: str) -> Any:
@@ -43,7 +62,9 @@ async def _run(args: argparse.Namespace) -> None:
     try:
         runtime = Runtime(backend)
         invocation = target(**json.loads(args.parameters))
-        run = await runtime.submit(invocation, idempotency_key=args.idempotency_key)
+        run = await runtime.submit(
+            invocation, idempotency_key=args.idempotency_key, priority=args.priority
+        )
         run = await runtime.run_until_complete(run.id)
         print(json.dumps({"id": run.id, "state": run.state, "output": run.output}, default=str))
         if run.state.value != "succeeded":
@@ -61,6 +82,7 @@ async def _worker(args: argparse.Namespace) -> None:
     supports_signals = hasattr(loop, "add_signal_handler")
     if supports_signals:
         loop.add_signal_handler(signal.SIGTERM, stop.set)
+        loop.add_signal_handler(signal.SIGINT, stop.set)
     try:
         for reference in args.pipeline:
             target = _object(reference)
@@ -69,15 +91,36 @@ async def _worker(args: argparse.Namespace) -> None:
             runtime.register(target.compile())
         from datetime import timedelta
 
-        worker = Worker(runtime, args.worker_id, lease_for=timedelta(seconds=args.lease_seconds))
+        worker = Worker(
+            runtime,
+            args.worker_id,
+            lease_for=timedelta(seconds=args.lease_seconds),
+            global_concurrency=args.global_concurrency,
+            termination_grace=args.termination_grace,
+        )
         while not stop.is_set():
             await backend.reap_expired_leases()
-            if not await worker.run_once():
+            work = asyncio.create_task(worker.run_once())
+            stopping = asyncio.create_task(stop.wait())
+            done, _ = await asyncio.wait((work, stopping), return_when=asyncio.FIRST_COMPLETED)
+            if stopping in done and not work.done():
+                try:
+                    await asyncio.wait_for(work, timeout=args.shutdown_grace)
+                except TimeoutError:
+                    work.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await work
+                break
+            stopping.cancel()
+            with suppress(asyncio.CancelledError):
+                await stopping
+            if not await work:
                 with suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=args.poll_interval)
     finally:
         if supports_signals:
             loop.remove_signal_handler(signal.SIGTERM)
+            loop.remove_signal_handler(signal.SIGINT)
         await backend.close()
 
 
@@ -181,10 +224,19 @@ async def _rerun(args: argparse.Namespace) -> None:
             idempotency_key=args.idempotency_key,
             rerun_of=original.id,
             trace_context=original.trace_context,
+            priority=original.priority,
+            policy=original.policy,
         )
         stored = await backend.create_run(run)
         if stored.id == run.id:
-            await backend.set_run_state(run.id, RunState.RUNNING)
+            await backend.admit_run(
+                run.id,
+                max_active_runs=(
+                    None
+                    if original.policy.get("max_active_runs") is None
+                    else int(original.policy["max_active_runs"])
+                ),
+            )
             stored = await backend.get_run(run.id)
         print(json.dumps({"id": stored.id, "state": stored.state.value, "rerun_of": original.id}))
     finally:
@@ -212,6 +264,14 @@ async def _serve(args: argparse.Namespace) -> None:
         shutdown_grace=args.shutdown_grace,
         owns_backend=True,
         run_triggers=not args.no_scheduler,
+        global_concurrency=args.global_concurrency,
+        artifact_store=(
+            None if args.artifact_store is None else load_artifact_store(args.artifact_store)
+        ),
+        maintenance_interval=args.maintenance_interval,
+        maintenance_batch_size=args.maintenance_batch_size,
+        run_maintenance=not args.no_maintenance,
+        termination_grace=args.termination_grace,
     )
     from lightpipe.api import create_app
 
@@ -292,6 +352,184 @@ async def _database(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+async def _backfill(args: argparse.Namespace) -> None:
+    backend = await load_backend(args.backend)
+    runtime = Runtime(backend)
+    submitted = duplicates = deferred = invalid = 0
+    try:
+        target = _object(args.definition)
+        if args.backfill_kind == "pipeline":
+            if not isinstance(target, Pipeline):
+                raise TypeError("pipeline backfill requires a @pipeline object")
+            runtime.register(target.compile())
+            with (
+                nullcontext(sys.stdin)
+                if args.input == "-"
+                else Path(args.input).open(encoding="utf-8")
+            ) as stream:
+                for line_number, line in enumerate(stream, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        item = json.loads(line)
+                        parameters = item["parameters"]
+                        if not isinstance(parameters, dict):
+                            raise ValueError("parameters must be an object")
+                        key = item.get("idempotency_key") or (
+                            f"backfill:{target.name}:{args.batch_id}:{line_number}"
+                        )
+                        if not isinstance(key, str):
+                            raise ValueError("idempotency_key must be a string")
+                        existed = await backend.find_idempotent_run(target.name, key)
+                        run = await runtime.submit(
+                            target(**parameters),
+                            idempotency_key=key,
+                            priority=item.get("priority", args.priority),
+                        )
+                        if existed is None:
+                            submitted += 1
+                        else:
+                            duplicates += 1
+                        deferred += int(run.state == RunState.PENDING)
+                    except Exception:
+                        invalid += 1
+                        if not args.continue_on_error:
+                            raise
+        else:
+            if not isinstance(target, Schedule):
+                raise TypeError("schedule backfill requires a @schedule object")
+            start = _date(args.from_time)
+            finish = _date(args.to_time)
+            assert start is not None and finish is not None
+            if start > finish:
+                raise ValueError("--from must not be later than --to")
+            await backend.register_trigger(trigger_record(target))
+            if target.interval is not None:
+                occurrences = []
+                candidate = start
+                while candidate <= finish:
+                    occurrences.append(candidate)
+                    candidate += target.interval
+            else:
+                assert target.cron is not None
+                expression = CronExpression(target.cron)
+                occurrences = []
+                candidate = expression.next_after(start - timedelta(minutes=1), target.timezone)
+                while candidate <= finish:
+                    occurrences.append(candidate)
+                    candidate = expression.next_after(candidate, target.timezone)
+            for scheduled_for in occurrences:
+                occurrence, created = await backend.add_trigger_occurrence(
+                    TriggerOccurrenceRecord(
+                        new_id("trigger_event"),
+                        target.name,
+                        TriggerOccurrenceState.PENDING,
+                        utcnow(),
+                        scheduled_for=scheduled_for,
+                    )
+                )
+                if not created:
+                    duplicates += 1
+                    continue
+                context = ScheduledOccurrence(target.name, scheduled_for)
+                invocation = (
+                    target.invocation_factory()
+                    if not inspect.signature(target.invocation_factory).parameters
+                    else target.invocation_factory(context)
+                )
+                prefix = target.idempotency_prefix or f"schedule:{target.name}"
+                run = await runtime.submit(
+                    invocation,
+                    idempotency_key=f"{prefix}:{scheduled_for.isoformat()}",
+                    trigger_name=target.name,
+                    trigger_occurrence_id=occurrence.id,
+                    priority=args.priority,
+                )
+                await backend.update_trigger_occurrence(
+                    occurrence.id, TriggerOccurrenceState.LAUNCHED.value, run_ids=[run.id]
+                )
+                submitted += 1
+                deferred += int(run.state == RunState.PENDING)
+        print(
+            json.dumps(
+                {
+                    "submitted": submitted,
+                    "duplicates": duplicates,
+                    "deferred": deferred,
+                    "invalid": invalid,
+                }
+            )
+        )
+    finally:
+        await backend.close()
+
+
+async def _artifact_command(args: argparse.Namespace) -> None:
+    backend = await load_backend(args.backend)
+    try:
+        if args.artifact_command == "gc":
+            runner = MaintenanceRunner(
+                backend,
+                load_artifact_store(args.store),
+                batch_size=args.batch_size,
+                artifact_grace=timedelta(seconds=args.grace_seconds),
+            )
+            value = await runner.run_once(dry_run=args.dry_run)
+        elif args.artifact_command == "pin":
+            pin = ArtifactPin(
+                new_id("pin"), args.uri, args.label, expires_at=_date(args.expires_at)
+            )
+            value: Any = await backend.pin_artifact(pin)
+        elif args.artifact_command == "pins":
+            value = await backend.artifact_pins()
+        else:
+            await backend.unpin_artifact(args.pin_id)
+            value = {"removed": args.pin_id}
+        print(json.dumps(value, default=_json_default, indent=2))
+    finally:
+        await backend.close()
+
+
+async def _retention_command(args: argparse.Namespace) -> None:
+    backend = await load_backend(args.backend)
+    try:
+        report = await MaintenanceRunner(backend, batch_size=args.batch_size).run_once(
+            dry_run=args.dry_run
+        )
+        print(json.dumps(report, default=_json_default, indent=2))
+    finally:
+        await backend.close()
+
+
+async def _recover_command(args: argparse.Namespace) -> None:
+    backend = await load_backend(args.backend)
+    try:
+        if args.recover_command == "reap-leases":
+            value: Any = {"released": await backend.reap_expired_leases()}
+        elif args.recover_command == "stale-workers":
+            before = utcnow() - timedelta(seconds=args.stale_after)
+            value = await backend.stale_workers(before=before)
+        elif args.recover_command == "release-worker":
+            if not args.force:
+                raise ValueError("release-worker requires --force")
+            value = {
+                "worker_id": args.worker_id,
+                "released": await backend.force_release_worker(args.worker_id),
+            }
+        else:
+            runtime = Runtime(backend)
+            for reference in args.pipeline:
+                target = _object(reference)
+                if not isinstance(target, Pipeline):
+                    raise TypeError(f"{reference} is not a @pipeline object")
+                runtime.register(target.compile())
+            await runtime.reconcile_all()
+            value = {"reconciled": True}
+        print(json.dumps(value, default=_json_default, indent=2))
+    finally:
+        await backend.close()
+
+
 def _load_definitions(
     references: list[str],
 ) -> tuple[dict[str, Pipeline], tuple[TriggerDefinition, ...]]:
@@ -325,6 +563,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("pipeline", help="decorated pipeline as module:object")
     run.add_argument("--parameters", default="{}", help="JSON parameter object")
     run.add_argument("--idempotency-key")
+    run.add_argument("--priority", type=int)
     run.set_defaults(handler=_run)
 
     worker = commands.add_parser("worker", help="run a worker against a durable backend")
@@ -332,6 +571,9 @@ def parser() -> argparse.ArgumentParser:
     worker.add_argument("--worker-id", default="worker-1")
     worker.add_argument("--poll-interval", type=float, default=1.0)
     worker.add_argument("--lease-seconds", type=float, default=300.0)
+    worker.add_argument("--global-concurrency", type=int)
+    worker.add_argument("--termination-grace", type=float, default=1.0)
+    worker.add_argument("--shutdown-grace", type=float, default=10.0)
     worker.set_defaults(handler=_worker)
 
     inspect = commands.add_parser("inspect", help="show a run and its tasks")
@@ -381,6 +623,12 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--shutdown-grace", type=float, default=10.0)
     serve.add_argument("--no-process-isolation", action="store_true")
     serve.add_argument("--no-scheduler", action="store_true")
+    serve.add_argument("--global-concurrency", type=int)
+    serve.add_argument("--artifact-store")
+    serve.add_argument("--maintenance-interval", type=float, default=60.0)
+    serve.add_argument("--maintenance-batch-size", type=int, default=100)
+    serve.add_argument("--no-maintenance", action="store_true")
+    serve.add_argument("--termination-grace", type=float, default=1.0)
     serve.add_argument("--log-level", default="info")
     serve.set_defaults(handler=_serve)
 
@@ -410,6 +658,57 @@ def parser() -> argparse.ArgumentParser:
     history.add_argument("--cursor")
     history.add_argument("--limit", type=int, default=100)
     trigger.set_defaults(handler=_trigger_command)
+
+    backfill = commands.add_parser("backfill", help="submit historical scheduled or batch work")
+    backfill_kinds = backfill.add_subparsers(dest="backfill_kind", required=True)
+    backfill_pipeline = backfill_kinds.add_parser("pipeline")
+    backfill_pipeline.add_argument("definition", help="decorated pipeline as module:object")
+    backfill_pipeline.add_argument("--input", required=True, help="JSONL file or - for stdin")
+    backfill_pipeline.add_argument("--batch-id", required=True)
+    backfill_pipeline.add_argument("--priority", type=int)
+    backfill_pipeline.add_argument("--continue-on-error", action="store_true")
+    backfill_schedule = backfill_kinds.add_parser("schedule")
+    backfill_schedule.add_argument("definition", help="decorated schedule as module:object")
+    backfill_schedule.add_argument("--from", dest="from_time", required=True)
+    backfill_schedule.add_argument("--to", dest="to_time", required=True)
+    backfill_schedule.add_argument("--priority", type=int)
+    backfill_schedule.set_defaults(continue_on_error=False)
+    backfill.set_defaults(handler=_backfill)
+
+    artifact = commands.add_parser("artifact", help="manage artifact retention pins")
+    artifact_commands = artifact.add_subparsers(dest="artifact_command", required=True)
+    pin = artifact_commands.add_parser("pin")
+    pin.add_argument("uri")
+    pin.add_argument("--label", required=True)
+    pin.add_argument("--expires-at")
+    artifact_commands.add_parser("pins")
+    unpin = artifact_commands.add_parser("unpin")
+    unpin.add_argument("pin_id")
+    gc = artifact_commands.add_parser("gc")
+    gc.add_argument("--store", required=True)
+    gc.add_argument("--batch-size", type=int, default=100)
+    gc.add_argument("--grace-seconds", type=float, default=86400)
+    gc.add_argument("--dry-run", action="store_true")
+    artifact.set_defaults(handler=_artifact_command)
+
+    retention = commands.add_parser("retention", help="run retention maintenance")
+    retention_commands = retention.add_subparsers(dest="retention_command", required=True)
+    retention_run = retention_commands.add_parser("run")
+    retention_run.add_argument("--batch-size", type=int, default=100)
+    retention_run.add_argument("--dry-run", action="store_true")
+    retention.set_defaults(handler=_retention_command)
+
+    recover = commands.add_parser("recover", help="inspect and repair orphaned work")
+    recover_commands = recover.add_subparsers(dest="recover_command", required=True)
+    recover_commands.add_parser("reap-leases")
+    stale = recover_commands.add_parser("stale-workers")
+    stale.add_argument("--stale-after", type=float, default=600.0)
+    release = recover_commands.add_parser("release-worker")
+    release.add_argument("worker_id")
+    release.add_argument("--force", action="store_true")
+    reconcile = recover_commands.add_parser("reconcile")
+    reconcile.add_argument("pipeline", nargs="+")
+    recover.set_defaults(handler=_recover_command)
     return root
 
 

@@ -152,6 +152,7 @@ async def execute_in_subprocess(
     heartbeat: Callable[[], Awaitable[None]] | None = None,
     log: Callable[[LogMessage], Awaitable[None]] | None = None,
     heartbeat_interval: float = 1.0,
+    termination_grace: float = 1.0,
 ) -> Any:
     """Execute a stage in a supervised Linux child process."""
     context = multiprocessing.get_context("fork")
@@ -189,4 +190,7 @@ async def execute_in_subprocess(
         parent.close()
         if process.is_alive():
             process.terminate()
+            process.join(timeout=termination_grace)
+        if process.is_alive():
+            process.kill()
         process.join(timeout=1)
