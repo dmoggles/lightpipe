@@ -8,7 +8,7 @@ import json
 import signal
 import sys
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +18,7 @@ from lightpipe.models import RunRecord, RunState, new_id
 from lightpipe.observability import configure_observability
 from lightpipe.runtime import Runtime, Worker
 from lightpipe.service import ServiceSupervisor
-from lightpipe.triggers import Poller, Schedule
+from lightpipe.triggers import Poller, Schedule, TriggerDefinition, Webhook
 
 
 def _object(reference: str) -> Any:
@@ -28,8 +28,9 @@ def _object(reference: str) -> Any:
     # Console-script launchers put their own bin directory at sys.path[0]. Pipeline
     # definitions are commonly modules in the operator's current project.
     working_directory = str(Path.cwd())
-    if working_directory not in sys.path:
-        sys.path.insert(0, working_directory)
+    if working_directory in sys.path:
+        sys.path.remove(working_directory)
+    sys.path.insert(0, working_directory)
     return getattr(importlib.import_module(module_name), object_name)
 
 
@@ -210,6 +211,7 @@ async def _serve(args: argparse.Namespace) -> None:
         reconcile_interval=args.reconcile_interval,
         shutdown_grace=args.shutdown_grace,
         owns_backend=True,
+        run_triggers=not args.no_scheduler,
     )
     from lightpipe.api import create_app
 
@@ -221,6 +223,59 @@ async def _serve(args: argparse.Namespace) -> None:
         await server.serve()
     finally:
         await service.stop()
+
+
+async def _scheduler(args: argparse.Namespace) -> None:
+    configure_observability()
+    pipelines, triggers = _load_definitions(args.definition)
+    if not triggers:
+        raise ValueError("scheduler requires at least one trigger definition")
+    backend = await load_backend(args.backend)
+    service = ServiceSupervisor(
+        backend,
+        pipelines,
+        triggers=triggers,
+        worker_count=0,
+        poll_interval=args.poll_interval,
+        reconcile_interval=args.reconcile_interval,
+        shutdown_grace=args.shutdown_grace,
+        owns_backend=True,
+        trigger_owner=args.owner,
+        trigger_lease_for=timedelta(seconds=args.lease_seconds),
+    )
+    await service.start()
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    supports_signals = hasattr(loop, "add_signal_handler")
+    if supports_signals:
+        loop.add_signal_handler(signal.SIGTERM, stop.set)
+        loop.add_signal_handler(signal.SIGINT, stop.set)
+    try:
+        await stop.wait()
+    finally:
+        await service.stop()
+
+
+async def _trigger_command(args: argparse.Namespace) -> None:
+    backend = await load_backend(args.backend)
+    try:
+        if args.trigger_command == "list":
+            items, cursor = await backend.list_triggers(
+                limit=args.limit, cursor=args.cursor, kind=args.kind, enabled=args.enabled
+            )
+            value: Any = {"items": items, "next_cursor": cursor}
+        elif args.trigger_command == "show":
+            value = await backend.get_trigger(args.name)
+        elif args.trigger_command == "history":
+            items, cursor = await backend.trigger_history(
+                args.name, limit=args.limit, cursor=args.cursor
+            )
+            value = {"items": items, "next_cursor": cursor}
+        else:
+            value = await backend.set_trigger_enabled(args.name, args.trigger_command == "resume")
+        print(json.dumps(value, default=_json_default, indent=2))
+    finally:
+        await backend.close()
 
 
 async def _database(args: argparse.Namespace) -> None:
@@ -239,14 +294,16 @@ async def _database(args: argparse.Namespace) -> None:
 
 def _load_definitions(
     references: list[str],
-) -> tuple[dict[str, Pipeline], tuple[Poller | Schedule, ...]]:
+) -> tuple[dict[str, Pipeline], tuple[TriggerDefinition, ...]]:
     pipelines: dict[str, Pipeline] = {}
-    triggers: list[Poller | Schedule] = []
+    triggers: list[TriggerDefinition] = []
     names: set[str] = set()
     for reference in references:
         target = _object(reference)
-        if not isinstance(target, (Pipeline, Poller, Schedule)):
-            raise TypeError(f"{reference} is not a @pipeline, @poller, or @schedule object")
+        if not isinstance(target, (Pipeline, Poller, Schedule, Webhook)):
+            raise TypeError(
+                f"{reference} is not a @pipeline, @poller, @schedule, or @webhook object"
+            )
         if target.name in names:
             raise ValueError(f"duplicate definition name: {target.name}")
         names.add(target.name)
@@ -314,7 +371,7 @@ def parser() -> argparse.ArgumentParser:
 
     serve = commands.add_parser("serve", help="launch the API, dashboard, and local workers")
     serve.add_argument(
-        "definition", nargs="+", help="module:object pipelines, pollers, and schedules"
+        "definition", nargs="+", help="module:object pipelines, pollers, schedules, and webhooks"
     )
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
@@ -323,8 +380,36 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--reconcile-interval", type=float, default=0.5)
     serve.add_argument("--shutdown-grace", type=float, default=10.0)
     serve.add_argument("--no-process-isolation", action="store_true")
+    serve.add_argument("--no-scheduler", action="store_true")
     serve.add_argument("--log-level", default="info")
     serve.set_defaults(handler=_serve)
+
+    scheduler = commands.add_parser("scheduler", help="run registered triggers without an API")
+    scheduler.add_argument(
+        "definition", nargs="+", help="module:object pipeline and trigger definitions"
+    )
+    scheduler.add_argument("--poll-interval", type=float, default=1.0)
+    scheduler.add_argument("--owner", default="scheduler-1")
+    scheduler.add_argument("--lease-seconds", type=float, default=60.0)
+    scheduler.add_argument("--reconcile-interval", type=float, default=0.5)
+    scheduler.add_argument("--shutdown-grace", type=float, default=10.0)
+    scheduler.set_defaults(handler=_scheduler)
+
+    trigger = commands.add_parser("trigger", help="inspect and manage durable triggers")
+    trigger_commands = trigger.add_subparsers(dest="trigger_command", required=True)
+    trigger_list = trigger_commands.add_parser("list")
+    trigger_list.add_argument("--kind", choices=["poller", "interval", "cron", "webhook"])
+    trigger_list.add_argument("--enabled", action=argparse.BooleanOptionalAction)
+    trigger_list.add_argument("--cursor")
+    trigger_list.add_argument("--limit", type=int, default=100)
+    for command in ("show", "pause", "resume"):
+        item = trigger_commands.add_parser(command)
+        item.add_argument("name")
+    history = trigger_commands.add_parser("history")
+    history.add_argument("name")
+    history.add_argument("--cursor")
+    history.add_argument("--limit", type=int, default=100)
+    trigger.set_defaults(handler=_trigger_command)
     return root
 
 

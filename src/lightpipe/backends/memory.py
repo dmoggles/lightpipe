@@ -27,7 +27,11 @@ from lightpipe.models import (
     TaskLease,
     TaskRecord,
     TaskState,
+    TriggerKind,
     TriggerLease,
+    TriggerOccurrenceRecord,
+    TriggerOccurrenceState,
+    TriggerRecord,
     new_id,
     utcnow,
 )
@@ -46,6 +50,8 @@ class MemoryBackend(OrchestrationBackend):
         self._cache: dict[str, CacheEntry] = {}
         self._expanded: dict[tuple[str, str], int] = {}
         self._triggers: dict[str, dict[str, Any]] = {}
+        self._trigger_records: dict[str, TriggerRecord] = {}
+        self._trigger_occurrences: list[TriggerOccurrenceRecord] = []
         self._definitions: dict[str, PipelineDefinitionRecord] = {}
         self._attempts: dict[str, list[TaskAttemptRecord]] = {}
         self._logs: list[StageLogRecord] = []
@@ -533,15 +539,30 @@ class MemoryBackend(OrchestrationBackend):
     ) -> TriggerLease | None:
         now = utcnow()
         async with self._lock:
+            record = self._trigger_records.get(name)
+            if record is not None and not record.enabled:
+                return None
             state = self._triggers.setdefault(name, {"cursor": None})
             if state.get("expires_at") and state["expires_at"] > now:
                 return None
             token = new_id("trigger_lease")
             expires = now + lease_for
             state.update(owner=owner, token=token, expires_at=expires)
+            if record is not None:
+                record.lease_owner = owner
+                record.lease_expires_at = expires
+                record.updated_at = now
             return TriggerLease(name, token, state["cursor"], expires)
 
-    async def complete_trigger(self, name: str, token: str, cursor: Any) -> None:
+    async def complete_trigger(
+        self,
+        name: str,
+        token: str,
+        cursor: Any,
+        *,
+        last_due_at: datetime | None = None,
+        next_due_at: datetime | None = None,
+    ) -> None:
         async with self._lock:
             state = self._triggers[name]
             expires_at = state.get("expires_at")
@@ -552,6 +573,13 @@ class MemoryBackend(OrchestrationBackend):
             ):
                 raise StaleLeaseError(f"stale trigger lease for {name}")
             state.update(cursor=_json_copy(cursor), owner=None, token=None, expires_at=None)
+            if record := self._trigger_records.get(name):
+                record.cursor = _json_copy(cursor)
+                record.last_due_at = last_due_at or record.last_due_at
+                record.next_due_at = next_due_at
+                record.lease_owner = None
+                record.lease_expires_at = None
+                record.updated_at = utcnow()
 
     async def fail_trigger(self, name: str, token: str) -> None:
         async with self._lock:
@@ -559,6 +587,146 @@ class MemoryBackend(OrchestrationBackend):
             if state.get("token") != token:
                 raise StaleLeaseError(f"stale trigger lease for {name}")
             state.update(owner=None, token=None, expires_at=None)
+            if record := self._trigger_records.get(name):
+                record.lease_owner = None
+                record.lease_expires_at = None
+                record.updated_at = utcnow()
+
+    async def register_trigger(self, trigger: TriggerRecord) -> TriggerRecord:
+        async with self._lock:
+            existing = self._trigger_records.get(trigger.name)
+            if existing is None:
+                lease_state = self._triggers.setdefault(
+                    trigger.name, {"cursor": _json_copy(trigger.cursor)}
+                )
+                stored = replace(trigger)
+                stored.cursor = _json_copy(lease_state.get("cursor"))
+                self._trigger_records[trigger.name] = stored
+            else:
+                existing.kind = trigger.kind
+                existing.definition_hash = trigger.definition_hash
+                existing.config = _json_copy(trigger.config)
+                if trigger.next_due_at is not None and existing.next_due_at is None:
+                    existing.next_due_at = trigger.next_due_at
+                existing.updated_at = utcnow()
+            return replace(self._trigger_records[trigger.name])
+
+    async def get_trigger(self, name: str) -> TriggerRecord:
+        async with self._lock:
+            if name not in self._trigger_records:
+                raise KeyError(name)
+            return replace(self._trigger_records[name])
+
+    async def list_triggers(
+        self,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        kind: str | None = None,
+        enabled: bool | None = None,
+    ) -> tuple[list[TriggerRecord], str | None]:
+        async with self._lock:
+            values = sorted(self._trigger_records.values(), key=lambda item: item.name)
+            if kind is not None:
+                values = [item for item in values if item.kind == TriggerKind(kind)]
+            if enabled is not None:
+                values = [item for item in values if item.enabled is enabled]
+            if cursor is not None:
+                values = [item for item in values if item.name > cursor]
+            page = values[: limit + 1]
+            next_cursor = page[limit - 1].name if len(page) > limit else None
+            return [replace(item) for item in page[:limit]], next_cursor
+
+    async def set_trigger_enabled(self, name: str, enabled: bool) -> TriggerRecord:
+        async with self._lock:
+            if name not in self._trigger_records:
+                raise KeyError(name)
+            record = self._trigger_records[name]
+            record.enabled = enabled
+            record.updated_at = utcnow()
+            if not enabled:
+                state = self._triggers.setdefault(name, {"cursor": record.cursor})
+                state.update(owner=None, token=None, expires_at=None)
+                record.lease_owner = None
+                record.lease_expires_at = None
+            return replace(record)
+
+    async def heartbeat_trigger(
+        self, name: str, token: str, *, lease_for: timedelta = DEFAULT_TRIGGER_LEASE
+    ) -> datetime:
+        async with self._lock:
+            state = self._triggers[name]
+            expires_at = state.get("expires_at")
+            if (
+                state.get("token") != token
+                or not isinstance(expires_at, datetime)
+                or expires_at <= utcnow()
+            ):
+                raise StaleLeaseError(f"stale trigger lease for {name}")
+            expires = utcnow() + lease_for
+            state["expires_at"] = expires
+            if record := self._trigger_records.get(name):
+                record.lease_expires_at = expires
+            return expires
+
+    async def add_trigger_occurrence(
+        self, occurrence: TriggerOccurrenceRecord
+    ) -> tuple[TriggerOccurrenceRecord, bool]:
+        async with self._lock:
+            for existing in self._trigger_occurrences:
+                duplicate_delivery = (
+                    occurrence.delivery_id is not None
+                    and existing.trigger_name == occurrence.trigger_name
+                    and existing.delivery_id == occurrence.delivery_id
+                )
+                duplicate_schedule = (
+                    occurrence.scheduled_for is not None
+                    and existing.trigger_name == occurrence.trigger_name
+                    and existing.scheduled_for == occurrence.scheduled_for
+                )
+                if duplicate_delivery or duplicate_schedule:
+                    return replace(existing), False
+            stored = replace(occurrence)
+            self._trigger_occurrences.append(stored)
+        await self._notify()
+        return replace(stored), True
+
+    async def update_trigger_occurrence(
+        self,
+        occurrence_id: str,
+        state: str,
+        *,
+        run_ids: list[str] | None = None,
+        detail: str | None = None,
+    ) -> TriggerOccurrenceRecord:
+        async with self._lock:
+            occurrence = next(
+                (item for item in self._trigger_occurrences if item.id == occurrence_id), None
+            )
+            if occurrence is None:
+                raise KeyError(occurrence_id)
+            occurrence.state = TriggerOccurrenceState(state)
+            if run_ids is not None:
+                occurrence.run_ids = list(run_ids)
+            occurrence.detail = detail
+            occurrence.updated_at = utcnow()
+            result = replace(occurrence)
+        await self._notify()
+        return result
+
+    async def trigger_history(
+        self, name: str, *, limit: int = 100, cursor: str | None = None
+    ) -> tuple[list[TriggerOccurrenceRecord], str | None]:
+        async with self._lock:
+            values = [
+                item for item in reversed(self._trigger_occurrences) if item.trigger_name == name
+            ]
+            if cursor is not None:
+                ids = [item.id for item in values]
+                values = values[ids.index(cursor) + 1 :] if cursor in ids else []
+            page = values[: limit + 1]
+            next_cursor = page[limit - 1].id if len(page) > limit else None
+            return [replace(item) for item in page[:limit]], next_cursor
 
     async def close(self) -> None:
         return None

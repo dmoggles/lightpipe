@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import hashlib
+import hmac
 import json
+import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -9,10 +14,13 @@ from enum import Enum
 from importlib.resources import files
 from typing import Any
 
-from lightpipe.models import ArtifactRef, InvalidTransitionError, RunState
+from lightpipe.models import ArtifactRef, InvalidTransitionError, RunState, utcnow
 from lightpipe.observability import span
 from lightpipe.runtime import Runtime
-from lightpipe.service import ServiceSupervisor, TriggerDefinition
+from lightpipe.service import ServiceSupervisor
+from lightpipe.triggers import TriggerDefinition, TriggerRunner, Webhook, WebhookEvent
+
+_FastAPIRequest: Any = Any
 
 
 def _json_default(value: Any) -> Any:
@@ -48,13 +56,15 @@ def create_app(
     worker_count: int = 1,
     process_isolation: bool = True,
     owns_backend: bool = False,
+    run_triggers: bool = True,
 ) -> Any:
     try:
-        from fastapi import FastAPI, Header, HTTPException
+        from fastapi import FastAPI, Header, HTTPException, Request
         from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
         from fastapi.staticfiles import StaticFiles
     except ImportError as error:
         raise RuntimeError("install lightpipe[api] to create the control API") from error
+    globals()["_FastAPIRequest"] = Request
 
     service = supervisor or ServiceSupervisor(
         runtime.backend,
@@ -63,10 +73,12 @@ def create_app(
         worker_count=worker_count,
         process_isolation=process_isolation,
         owns_backend=owns_backend,
+        run_triggers=run_triggers,
     )
     if supervisor is not None and supervisor.backend is not runtime.backend:
         raise ValueError("supervisor and API runtime must share a backend")
     runtime = service.runtime
+    registered_triggers = {item.name: item for item in service.triggers}
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -344,6 +356,134 @@ def create_app(
         if not isinstance(task_ids, list) or not all(isinstance(item, str) for item in task_ids):
             raise HTTPException(422, "task_ids must be an array of task IDs")
         return await control_error(runtime.retry_failed(run_id, task_ids=tuple(task_ids)))
+
+    @app.get("/api/v1/triggers")
+    async def v1_triggers(
+        limit: int = 100,
+        cursor: str | None = None,
+        kind: str | None = None,
+        enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        if kind is not None and kind not in {"poller", "interval", "cron", "webhook"}:
+            raise HTTPException(422, "unknown trigger kind")
+        items, next_cursor = await runtime.backend.list_triggers(
+            limit=checked_limit(limit), cursor=cursor, kind=kind, enabled=enabled
+        )
+        return {"items": items, "next_cursor": next_cursor}
+
+    @app.get("/api/v1/triggers/{name}")
+    async def v1_trigger(name: str) -> Any:
+        try:
+            trigger = await runtime.backend.get_trigger(name)
+        except KeyError as error:
+            raise HTTPException(404, f"unknown trigger {name}") from error
+        history, _ = await runtime.backend.trigger_history(name, limit=10)
+        return {"trigger": trigger, "recent_occurrences": history}
+
+    @app.get("/api/v1/triggers/{name}/history")
+    async def v1_trigger_history(
+        name: str, limit: int = 100, cursor: str | None = None
+    ) -> dict[str, Any]:
+        try:
+            await runtime.backend.get_trigger(name)
+        except KeyError as error:
+            raise HTTPException(404, f"unknown trigger {name}") from error
+        items, next_cursor = await runtime.backend.trigger_history(
+            name, limit=checked_limit(limit), cursor=cursor
+        )
+        return {"items": items, "next_cursor": next_cursor}
+
+    @app.post("/api/v1/triggers/{name}/pause")
+    async def v1_pause_trigger(name: str) -> Any:
+        try:
+            return await runtime.backend.set_trigger_enabled(name, False)
+        except KeyError as error:
+            raise HTTPException(404, f"unknown trigger {name}") from error
+
+    @app.post("/api/v1/triggers/{name}/resume")
+    async def v1_resume_trigger(name: str) -> Any:
+        try:
+            return await runtime.backend.set_trigger_enabled(name, True)
+        except KeyError as error:
+            raise HTTPException(404, f"unknown trigger {name}") from error
+
+    @app.get("/api/v1/triggers/{name}/events")
+    async def v1_trigger_events(
+        name: str, last_event_id: str | None = Header(None)
+    ) -> StreamingResponse:
+        try:
+            await runtime.backend.get_trigger(name)
+        except KeyError as error:
+            raise HTTPException(404, f"unknown trigger {name}") from error
+
+        async def generate_trigger_events() -> AsyncIterator[str]:
+            seen = last_event_id
+            while True:
+                items, _ = await runtime.backend.trigger_history(name, limit=200)
+                chronological = list(reversed(items))
+                if seen is not None:
+                    ids = [item.id for item in chronological]
+                    chronological = chronological[ids.index(seen) + 1 :] if seen in ids else []
+                for item in chronological:
+                    seen = item.id
+                    yield f"id: {item.id}\ndata: {json.dumps(item, default=_json_default)}\n\n"
+                await asyncio.sleep(0.5)
+
+        return StreamingResponse(generate_trigger_events(), media_type="text/event-stream")
+
+    @app.post("/api/v1/webhooks/{name}", status_code=202)
+    async def v1_webhook(
+        name: str,
+        request: _FastAPIRequest,
+        x_lightpipe_timestamp: str | None = Header(None),
+        x_lightpipe_delivery: str | None = Header(None),
+        x_lightpipe_signature: str | None = Header(None),
+    ) -> Any:
+        definition = registered_triggers.get(name)
+        if not isinstance(definition, Webhook):
+            raise HTTPException(404, f"unknown webhook {name}")
+        if not x_lightpipe_timestamp or not x_lightpipe_delivery or not x_lightpipe_signature:
+            raise HTTPException(401, "missing webhook authentication headers")
+        try:
+            timestamp = int(x_lightpipe_timestamp)
+        except ValueError as error:
+            raise HTTPException(401, "invalid webhook timestamp") from error
+        if abs(int(time.time()) - timestamp) > 300:
+            raise HTTPException(401, "webhook timestamp is outside the five-minute window")
+        body = await request.body()
+        if len(body) > 1024 * 1024:
+            raise HTTPException(413, "webhook body exceeds 1 MiB")
+        if request.headers.get("content-type", "").partition(";")[0].strip() != "application/json":
+            raise HTTPException(415, "webhook content type must be application/json")
+        secret = os.getenv(definition.secret_env)
+        if not secret:
+            raise HTTPException(503, f"webhook secret environment {definition.secret_env} is unset")
+        expected = (
+            "sha256="
+            + hmac.new(
+                secret.encode(),
+                x_lightpipe_timestamp.encode() + b"." + x_lightpipe_delivery.encode() + b"." + body,
+                hashlib.sha256,
+            ).hexdigest()
+        )
+        if not hmac.compare_digest(expected, x_lightpipe_signature):
+            raise HTTPException(401, "invalid webhook signature")
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HTTPException(422, "webhook body must be valid JSON") from error
+        try:
+            occurrence = await TriggerRunner(runtime, owner=f"webhook:{name}").run_webhook(
+                definition,
+                WebhookEvent(
+                    payload, x_lightpipe_delivery, utcnow(), request.headers.get("content-type", "")
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise HTTPException(422, str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(409, str(error)) from error
+        return occurrence
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard() -> str:

@@ -19,6 +19,9 @@ An adapter must provide the following guarantees:
    marker, allowing a crash to cause harmless repeated creation instead of lost work.
 9. Trigger leases provide the same fencing behavior as task leases and persist their cursor only on
    successful completion.
+10. Trigger definition upserts preserve enabled state and cursors; occurrence delivery IDs and
+    scheduled timestamps are unique per trigger, and history updates are durable.
+11. Paused triggers cannot be leased, and trigger heartbeats cannot revive stale fencing tokens.
 10. Cache publication is safe under concurrent writers, and expired entries are never returned.
 11. Every successful task claim creates one durable attempt record in the same atomic operation;
     fenced lifecycle transitions finish only that attempt.

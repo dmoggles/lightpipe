@@ -3,15 +3,19 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from lightpipe.backends.base import OrchestrationBackend
 from lightpipe.models import PipelineDefinitionRecord, utcnow
 from lightpipe.runtime import Runtime, Worker
-from lightpipe.triggers import Poller, Schedule, TriggerRunner
-
-type TriggerDefinition = Poller | Schedule
+from lightpipe.triggers import (
+    Poller,
+    Schedule,
+    TriggerDefinition,
+    TriggerRunner,
+    trigger_record,
+)
 
 
 @dataclass(slots=True)
@@ -49,17 +53,20 @@ class ServiceSupervisor:
         reconcile_interval: float = 0.5,
         shutdown_grace: float = 10.0,
         owns_backend: bool = False,
+        run_triggers: bool = True,
+        trigger_owner: str = "service",
+        trigger_lease_for: timedelta = timedelta(minutes=1),
     ) -> None:
         if worker_count < 0:
             raise ValueError("worker_count cannot be negative")
         if poll_interval <= 0 or reconcile_interval <= 0:
             raise ValueError("service intervals must be positive")
+        if trigger_lease_for.total_seconds() <= 0:
+            raise ValueError("trigger lease must be positive")
         definition_names = [pipeline.name for pipeline in pipelines.values()]
         definition_names.extend(trigger.name for trigger in triggers)
         if len(definition_names) != len(set(definition_names)):
             raise ValueError("pipeline and trigger definition names must be unique")
-        if any(trigger.interval.total_seconds() <= 0 for trigger in triggers):
-            raise ValueError("trigger intervals must be positive")
         self.backend = backend
         self.runtime = Runtime(backend)
         self.pipelines = dict(pipelines)
@@ -70,6 +77,9 @@ class ServiceSupervisor:
         self.reconcile_interval = reconcile_interval
         self.shutdown_grace = shutdown_grace
         self.owns_backend = owns_backend
+        self.run_triggers = run_triggers
+        self.trigger_owner = trigger_owner
+        self.trigger_lease_for = trigger_lease_for
         self.workers = [
             Worker(self.runtime, f"local-{index + 1}", process_isolation=process_isolation)
             for index in range(worker_count)
@@ -99,6 +109,8 @@ class ServiceSupervisor:
             await self.backend.put_definition(
                 PipelineDefinitionRecord(graph.definition_hash, graph.name, graph.public_dict())
             )
+        for trigger in self.triggers:
+            await self.backend.register_trigger(trigger_record(trigger))
         self.started = True
         self.stopping = False
         self._stop.clear()
@@ -107,10 +119,11 @@ class ServiceSupervisor:
                 asyncio.create_task(self._worker_loop(worker), name=f"worker:{worker.worker_id}")
             )
         self._tasks.append(asyncio.create_task(self._reconcile_loop(), name="reconciler"))
-        for trigger in self.triggers:
-            self._tasks.append(
-                asyncio.create_task(self._trigger_loop(trigger), name=f"trigger:{trigger.name}")
-            )
+        if self.run_triggers:
+            for trigger in self.triggers:
+                self._tasks.append(
+                    asyncio.create_task(self._trigger_loop(trigger), name=f"trigger:{trigger.name}")
+                )
 
     async def stop(self) -> None:
         if self._closed:
@@ -201,14 +214,20 @@ class ServiceSupervisor:
 
     async def _trigger_loop(self, definition: TriggerDefinition) -> None:
         status = self.trigger_status[definition.name]
-        runner = TriggerRunner(self.runtime, owner=f"service:{definition.name}")
+        runner = TriggerRunner(
+            self.runtime,
+            owner=f"{self.trigger_owner}:{definition.name}",
+            lease_for=self.trigger_lease_for,
+        )
         while not self._stop.is_set():
             status.state = "running"
             try:
                 if isinstance(definition, Poller):
                     launched = await runner.run_poller_once(definition)
-                else:
+                elif isinstance(definition, Schedule):
                     launched = int(await runner.run_schedule_once(definition))
+                else:
+                    launched = int(await runner.run_queued_once(definition))
                 status.launched_runs += launched
                 status.error = None
                 status.state = "idle"
@@ -218,5 +237,9 @@ class ServiceSupervisor:
                 status.state = "error"
                 status.error = f"{type(error).__name__}: {error}"
             status.last_checked_at = utcnow()
-            await self._wait(definition.interval.total_seconds())
+            if isinstance(definition, Poller):
+                delay = definition.interval.total_seconds()
+            else:
+                delay = max(0.25, self.poll_interval)
+            await self._wait(delay)
         status.state = "stopped"

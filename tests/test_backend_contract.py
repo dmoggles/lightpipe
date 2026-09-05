@@ -20,6 +20,10 @@ from lightpipe.models import (
     StaleLeaseError,
     TaskRecord,
     TaskState,
+    TriggerKind,
+    TriggerOccurrenceRecord,
+    TriggerOccurrenceState,
+    TriggerRecord,
     new_id,
     utcnow,
 )
@@ -265,6 +269,37 @@ async def test_backend_contract_expansion_cache_and_trigger(
     resumed = await backend.claim_trigger("trigger", "two")
     assert resumed is not None
     assert resumed.cursor == {"cursor": 2}
+
+
+@pytest.mark.asyncio
+async def test_backend_contract_managed_trigger_history(
+    backend: OrchestrationBackend,
+) -> None:
+    record = await backend.register_trigger(
+        TriggerRecord("managed", TriggerKind.CRON, "hash", {"cron": "0 9 * * *"})
+    )
+    assert record.enabled is True
+    assert (await backend.set_trigger_enabled("managed", False)).enabled is False
+    assert await backend.claim_trigger("managed", "owner") is None
+    await backend.set_trigger_enabled("managed", True)
+    occurrence = TriggerOccurrenceRecord(
+        "occurrence-1",
+        "managed",
+        TriggerOccurrenceState.PENDING,
+        utcnow(),
+        delivery_id="delivery-1",
+    )
+    stored, created = await backend.add_trigger_occurrence(occurrence)
+    duplicate, duplicate_created = await backend.add_trigger_occurrence(occurrence)
+    assert created is True
+    assert duplicate_created is False
+    assert duplicate.id == stored.id
+    await backend.update_trigger_occurrence(
+        stored.id, TriggerOccurrenceState.LAUNCHED.value, run_ids=["run-1"]
+    )
+    history, cursor = await backend.trigger_history("managed", limit=10)
+    assert cursor is None
+    assert history[0].run_ids == ["run-1"]
 
 
 @pytest.mark.asyncio
