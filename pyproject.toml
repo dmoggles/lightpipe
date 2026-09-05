@@ -1,5 +1,5 @@
 [project]
-name = "lightpipe"
+name = "lightpipeline"
 version = "0.2.0"
 description = "A lightweight, backend-neutral Python pipeline orchestrator"
 readme = "README.md"
