@@ -1015,6 +1015,20 @@ class PostgresBackend(OrchestrationBackend):
         UNION SELECT uri FROM lp_artifact_references
         """
         async with self._pool.connection() as connection, connection.transaction():
+            # Select only artifacts marked by an earlier scan. Even with a zero grace
+            # period, a newly unreferenced artifact must survive one complete scan so
+            # transient reference/index races cannot collect it immediately.
+            cursor = await connection.execute(
+                f"SELECT uri,digest,size,discovered_at FROM lp_artifacts "
+                f"WHERE candidate_since IS NOT NULL AND candidate_since<=%s "
+                f"AND discovered_at<=%s AND uri NOT IN ({live_sql}) "
+                f"ORDER BY candidate_since LIMIT %s",
+                (now - grace, now - grace, limit),
+            )
+            candidates = [
+                ArtifactObject(row["uri"], row["discovered_at"], row["digest"], row["size"])
+                for row in await cursor.fetchall()
+            ]
             active = await connection.execute(
                 "SELECT 1 FROM lp_tasks WHERE state IN ('leased','running') LIMIT 1"
             )
@@ -1027,16 +1041,7 @@ class PostgresBackend(OrchestrationBackend):
             await connection.execute(
                 f"UPDATE lp_artifacts SET candidate_since=NULL WHERE uri IN ({live_sql})"
             )
-            cursor = await connection.execute(
-                f"SELECT uri,digest,size,discovered_at FROM lp_artifacts "
-                f"WHERE candidate_since<=%s AND discovered_at<=%s "
-                f"AND uri NOT IN ({live_sql}) ORDER BY candidate_since LIMIT %s",
-                (now - grace, now - grace, limit),
-            )
-            return [
-                ArtifactObject(row["uri"], row["discovered_at"], row["digest"], row["size"])
-                for row in await cursor.fetchall()
-            ]
+            return candidates
 
     async def forget_artifact(self, uri: str) -> None:
         async with self._pool.connection() as connection:
