@@ -683,11 +683,22 @@ class TriggerRunner:
                 idempotency_key = item.get("idempotency_key")
                 if not isinstance(idempotency_key, str):
                     idempotency_key = None
+                priority = item.get("priority")
+                if priority is not None and (
+                    not isinstance(priority, int) or isinstance(priority, bool)
+                ):
+                    await self.backend.update_trigger_occurrence(
+                        pending.id,
+                        TriggerOccurrenceState.FAILED.value,
+                        detail="queued webhook priority is invalid",
+                    )
+                    await self.backend.complete_trigger(definition.name, lease.token, lease.cursor)
+                    return False
                 requests.append(
                     RunRequest(
                         PipelineInvocation(graph, dict(parameters)),
                         idempotency_key,
-                        None if item.get("priority") is None else int(item["priority"]),
+                        priority,
                     )
                 )
             await self._launch(definition.name, pending, requests, pending.delivery_id)

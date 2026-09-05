@@ -18,6 +18,7 @@ from lightpipe import (
     schedule,
     webhook,
 )
+from lightpipe.models import TriggerOccurrenceRecord, TriggerOccurrenceState, new_id
 from lightpipe.triggers import CronExpression, Schedule, Webhook, trigger_record
 
 
@@ -162,6 +163,45 @@ async def test_webhook_delivery_is_idempotent() -> None:
     second = await runner.run_webhook(incoming, event)
     assert first.id == second.id
     assert len(await backend.list_runs()) == 1
+
+
+@pytest.mark.asyncio
+async def test_queued_webhook_rejects_invalid_priority() -> None:
+    @pipeline
+    def flow(value: int):
+        return value
+
+    @webhook(overlap=OverlapPolicy.QUEUE)
+    def incoming(event: WebhookEvent):
+        return flow(event.payload["value"])
+
+    backend = MemoryBackend()
+    runtime = Runtime(backend)
+    graph = flow.compile()
+    runtime.register(graph)
+    await backend.register_trigger(trigger_record(incoming))
+    occurrence, _ = await backend.add_trigger_occurrence(
+        TriggerOccurrenceRecord(
+            new_id("trigger_event"),
+            incoming.name,
+            TriggerOccurrenceState.PENDING,
+            datetime.now(UTC),
+            requests=[
+                {
+                    "definition_hash": graph.definition_hash,
+                    "parameters": {"value": 4},
+                    "idempotency_key": None,
+                    "priority": ["invalid"],
+                }
+            ],
+        )
+    )
+
+    assert await TriggerRunner(runtime).run_queued_once(incoming) is False
+    history, _ = await backend.trigger_history(incoming.name)
+    stored = next(item for item in history if item.id == occurrence.id)
+    assert stored.state == TriggerOccurrenceState.FAILED
+    assert stored.detail == "queued webhook priority is invalid"
 
 
 def test_schedule_validation_and_policy_defaults() -> None:
