@@ -133,9 +133,16 @@ def create_app(
         parameters = body.get("parameters", {})
         if not isinstance(parameters, dict):
             raise HTTPException(422, "parameters must be a JSON object")
+        priority = body.get("priority")
+        if priority is not None and (not isinstance(priority, int) or isinstance(priority, bool)):
+            raise HTTPException(422, "priority must be an integer")
         try:
             invocation = pipelines[name](**parameters)
-            return await runtime.submit(invocation, idempotency_key=body.get("idempotency_key"))
+            return await runtime.submit(
+                invocation,
+                idempotency_key=body.get("idempotency_key"),
+                priority=priority,
+            )
         except (TypeError, ValueError) as error:
             raise HTTPException(422, str(error)) from error
 

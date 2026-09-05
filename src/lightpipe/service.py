@@ -6,7 +6,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
+from lightpipe.artifacts import ArtifactStore
 from lightpipe.backends.base import OrchestrationBackend
+from lightpipe.maintenance import MaintenanceReport, MaintenanceRunner
 from lightpipe.models import PipelineDefinitionRecord, utcnow
 from lightpipe.runtime import Runtime, Worker
 from lightpipe.triggers import (
@@ -56,6 +58,12 @@ class ServiceSupervisor:
         run_triggers: bool = True,
         trigger_owner: str = "service",
         trigger_lease_for: timedelta = timedelta(minutes=1),
+        global_concurrency: int | None = None,
+        artifact_store: ArtifactStore | None = None,
+        maintenance_interval: float = 60.0,
+        maintenance_batch_size: int = 100,
+        run_maintenance: bool = True,
+        termination_grace: float = 1.0,
     ) -> None:
         if worker_count < 0:
             raise ValueError("worker_count cannot be negative")
@@ -63,6 +71,8 @@ class ServiceSupervisor:
             raise ValueError("service intervals must be positive")
         if trigger_lease_for.total_seconds() <= 0:
             raise ValueError("trigger lease must be positive")
+        if maintenance_interval <= 0:
+            raise ValueError("maintenance interval must be positive")
         definition_names = [pipeline.name for pipeline in pipelines.values()]
         definition_names.extend(trigger.name for trigger in triggers)
         if len(definition_names) != len(set(definition_names)):
@@ -80,8 +90,28 @@ class ServiceSupervisor:
         self.run_triggers = run_triggers
         self.trigger_owner = trigger_owner
         self.trigger_lease_for = trigger_lease_for
+        self.maintenance_interval = maintenance_interval
+        self.run_maintenance = run_maintenance
+        grace = max(
+            (pipeline.policy.retention.artifact_grace for pipeline in pipelines.values()),
+            default=timedelta(days=1),
+        )
+        self.maintenance = MaintenanceRunner(
+            backend,
+            artifact_store,
+            owner=trigger_owner,
+            batch_size=maintenance_batch_size,
+            artifact_grace=grace,
+        )
+        self.maintenance_report = MaintenanceReport()
         self.workers = [
-            Worker(self.runtime, f"local-{index + 1}", process_isolation=process_isolation)
+            Worker(
+                self.runtime,
+                f"local-{index + 1}",
+                process_isolation=process_isolation,
+                global_concurrency=global_concurrency,
+                termination_grace=termination_grace,
+            )
             for index in range(worker_count)
         ]
         self.worker_status = {
@@ -124,6 +154,8 @@ class ServiceSupervisor:
                 self._tasks.append(
                     asyncio.create_task(self._trigger_loop(trigger), name=f"trigger:{trigger.name}")
                 )
+        if self.run_maintenance:
+            self._tasks.append(asyncio.create_task(self._maintenance_loop(), name="maintenance"))
 
     async def stop(self) -> None:
         if self._closed:
@@ -170,6 +202,7 @@ class ServiceSupervisor:
             "error": self.error,
             "workers": workers,
             "triggers": [asdict(status) for status in self.trigger_status.values()],
+            "maintenance": asdict(self.maintenance_report),
         }
 
     async def _wait(self, seconds: float) -> None:
@@ -211,6 +244,16 @@ class ServiceSupervisor:
             except Exception as error:
                 self.error = f"{type(error).__name__}: {error}"
             await self._wait(self.reconcile_interval)
+
+    async def _maintenance_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.maintenance_report = await self.maintenance.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.maintenance_report.deletion_errors.append(f"{type(error).__name__}: {error}")
+            await self._wait(self.maintenance_interval)
 
     async def _trigger_loop(self, definition: TriggerDefinition) -> None:
         status = self.trigger_status[definition.name]

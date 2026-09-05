@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from lightpipe.models import (
+    ArtifactObject,
+    ArtifactPin,
     CacheEntry,
     Event,
     PipelineDefinitionRecord,
@@ -20,10 +22,35 @@ from lightpipe.models import (
     TriggerLease,
     TriggerOccurrenceRecord,
     TriggerRecord,
+    WorkerRecord,
 )
 
 DEFAULT_TASK_LEASE = timedelta(minutes=5)
 DEFAULT_TRIGGER_LEASE = timedelta(minutes=1)
+
+
+def artifact_references(value: Any) -> dict[str, tuple[str | None, int | None]]:
+    """Return every serialized ArtifactRef nested in a JSON-compatible value."""
+    found: dict[str, tuple[str | None, int | None]] = {}
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            uri = item.get("$artifact")
+            if isinstance(uri, str):
+                digest = item.get("digest")
+                size = item.get("size")
+                found[uri] = (
+                    digest if isinstance(digest, str) else None,
+                    size if isinstance(size, int) else None,
+                )
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return found
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +91,18 @@ class OrchestrationBackend(ABC):
         created_before: datetime | None = None,
     ) -> tuple[list[RunRecord], str | None]: ...
 
+    async def find_idempotent_run(
+        self, pipeline_name: str, idempotency_key: str
+    ) -> RunRecord | None:
+        cursor: str | None = None
+        while True:
+            runs, cursor = await self.query_runs(
+                limit=1000, cursor=cursor, pipeline_name=pipeline_name
+            )
+            match = next((run for run in runs if run.idempotency_key == idempotency_key), None)
+            if match is not None or cursor is None:
+                return match
+
     @abstractmethod
     async def put_definition(self, definition: PipelineDefinitionRecord) -> None: ...
 
@@ -79,6 +118,11 @@ class OrchestrationBackend(ABC):
     async def set_run_state(self, run_id: str, state: RunState, *, output: Any = None) -> None: ...
 
     @abstractmethod
+    async def admit_run(self, run_id: str, *, max_active_runs: int | None = None) -> bool:
+        """Atomically move a pending run to running when pipeline capacity permits."""
+        ...
+
+    @abstractmethod
     async def add_task(self, task: TaskRecord) -> tuple[TaskRecord, bool]: ...
 
     @abstractmethod
@@ -89,7 +133,12 @@ class OrchestrationBackend(ABC):
 
     @abstractmethod
     async def claim_tasks(
-        self, worker_id: str, *, limit: int = 1, lease_for: timedelta = DEFAULT_TASK_LEASE
+        self,
+        worker_id: str,
+        *,
+        limit: int = 1,
+        lease_for: timedelta = DEFAULT_TASK_LEASE,
+        global_concurrency: int | None = None,
     ) -> list[TaskLease]: ...
 
     @abstractmethod
@@ -178,6 +227,48 @@ class OrchestrationBackend(ABC):
 
     @abstractmethod
     async def put_cache(self, entry: CacheEntry) -> None: ...
+
+    @abstractmethod
+    async def catalog_artifact(self, artifact: ArtifactObject) -> None: ...
+
+    @abstractmethod
+    async def artifact_gc_candidates(
+        self, *, now: datetime, grace: timedelta, limit: int = 100
+    ) -> list[ArtifactObject]: ...
+
+    @abstractmethod
+    async def forget_artifact(self, uri: str) -> None: ...
+
+    @abstractmethod
+    async def pin_artifact(self, pin: ArtifactPin) -> ArtifactPin: ...
+
+    @abstractmethod
+    async def artifact_pins(self) -> list[ArtifactPin]: ...
+
+    @abstractmethod
+    async def unpin_artifact(self, pin_id: str) -> None: ...
+
+    @abstractmethod
+    async def prune(self, *, now: datetime, limit: int = 100) -> dict[str, int]: ...
+
+    @abstractmethod
+    async def claim_maintenance(
+        self, name: str, owner: str, *, lease_for: timedelta
+    ) -> TriggerLease | None: ...
+
+    @abstractmethod
+    async def complete_maintenance(self, name: str, token: str) -> None: ...
+
+    @abstractmethod
+    async def heartbeat_worker(
+        self, worker_id: str, *, state: str, current_task_id: str | None = None
+    ) -> None: ...
+
+    @abstractmethod
+    async def stale_workers(self, *, before: datetime) -> list[WorkerRecord]: ...
+
+    @abstractmethod
+    async def force_release_worker(self, worker_id: str) -> int: ...
 
     @abstractmethod
     async def append_event(

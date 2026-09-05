@@ -9,6 +9,8 @@ subsystem, known gaps, and the recommended implementation sequence.
 For an operational walkthrough, see [Deploying pipelines with workers](docs/deploying-pipelines.md).
 For operator APIs, recovery semantics, and telemetry, see
 [Monitoring and recovery controls](docs/monitoring-and-controls.md).
+For retention, resource policies, backfills, and worker draining, see
+[Storage and execution hardening](docs/storage-and-execution-hardening.md).
 
 The project currently includes:
 
@@ -201,6 +203,6 @@ controls reuse; artifact retention is a separate concern.
 
 This initial implementation targets a single trusted operator. It does not provide multi-tenancy,
 RBAC, cyclic graphs, arbitrary topology mutation from stage code, or continuous record streaming.
-Cron-expression parsing and artifact reference garbage collection are follow-on operational work.
-Interval schedules and stateful pollers already keep
+Artifact garbage collection is opt-in and requires a configured shared store. Interval schedules
+and stateful pollers keep
 their ownership and cursor state in the selected orchestration backend.

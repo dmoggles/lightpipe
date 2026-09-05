@@ -31,6 +31,7 @@ from lightpipe.runtime import Runtime, _jsonable
 class RunRequest:
     invocation: PipelineInvocation
     idempotency_key: str | None = None
+    priority: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,6 +348,7 @@ class TriggerRunner:
                 idempotency_key=self._request_key(name, seed, index, request),
                 trigger_name=name,
                 trigger_occurrence_id=occurrence.id,
+                priority=request.priority,
             )
             run_ids.append(run.id)
         await self.backend.update_trigger_occurrence(
@@ -598,6 +600,7 @@ class TriggerRunner:
                         "definition_hash": item.invocation.graph.definition_hash,
                         "parameters": _jsonable(item.invocation.parameters),
                         "idempotency_key": item.idempotency_key,
+                        "priority": item.priority,
                     }
                     for item in requests
                 ]
@@ -680,10 +683,22 @@ class TriggerRunner:
                 idempotency_key = item.get("idempotency_key")
                 if not isinstance(idempotency_key, str):
                     idempotency_key = None
+                priority = item.get("priority")
+                if priority is not None and (
+                    not isinstance(priority, int) or isinstance(priority, bool)
+                ):
+                    await self.backend.update_trigger_occurrence(
+                        pending.id,
+                        TriggerOccurrenceState.FAILED.value,
+                        detail="queued webhook priority is invalid",
+                    )
+                    await self.backend.complete_trigger(definition.name, lease.token, lease.cursor)
+                    return False
                 requests.append(
                     RunRequest(
                         PipelineInvocation(graph, dict(parameters)),
                         idempotency_key,
+                        priority,
                     )
                 )
             await self._launch(definition.name, pending, requests, pending.delivery_id)

@@ -1,13 +1,24 @@
-from lightpipe.artifacts import ArtifactStore, FileArtifactStore, S3ArtifactStore
+from lightpipe.artifacts import (
+    ArtifactStore,
+    FileArtifactStore,
+    S3ArtifactStore,
+    load_artifact_store,
+)
 from lightpipe.backends import BackendCapabilities, MemoryBackend, OrchestrationBackend
 from lightpipe.dsl import MappedRef, NodeRef, Pipeline, PipelineInvocation, Stage, pipeline, stage
 from lightpipe.models import (
+    ArtifactObject,
+    ArtifactPin,
     ArtifactRef,
     AttemptState,
     CachePolicy,
+    CapacityExceededError,
     MissedRunPolicy,
     OverlapPolicy,
     PipelineDefinitionRecord,
+    PipelinePolicy,
+    RateLimit,
+    RetentionPolicy,
     RetryPolicy,
     RunState,
     StageLogRecord,
@@ -17,6 +28,7 @@ from lightpipe.models import (
     TriggerOccurrenceRecord,
     TriggerOccurrenceState,
     TriggerRecord,
+    WorkerRecord,
 )
 from lightpipe.runtime import Runtime, Worker
 from lightpipe.service import ServiceSupervisor
@@ -35,11 +47,14 @@ from lightpipe.triggers import (
 )
 
 __all__ = [
+    "ArtifactObject",
+    "ArtifactPin",
     "ArtifactRef",
     "ArtifactStore",
     "AttemptState",
     "BackendCapabilities",
     "CachePolicy",
+    "CapacityExceededError",
     "FileArtifactStore",
     "MappedRef",
     "MemoryBackend",
@@ -50,8 +65,11 @@ __all__ = [
     "Pipeline",
     "PipelineDefinitionRecord",
     "PipelineInvocation",
+    "PipelinePolicy",
     "PollResult",
     "Poller",
+    "RateLimit",
+    "RetentionPolicy",
     "RetryPolicy",
     "RunRequest",
     "RunState",
@@ -72,6 +90,8 @@ __all__ = [
     "Webhook",
     "WebhookEvent",
     "Worker",
+    "WorkerRecord",
+    "load_artifact_store",
     "pipeline",
     "poller",
     "schedule",
